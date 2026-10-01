@@ -19,14 +19,19 @@ READER_JSON = json.dumps([
     {"bbox": [200, 1810, 1000, 1850], "category": "Caption", "text": "Figure 1: K_3."},
 ])
 
-DESCRIPTION = """KIND: graph
+DESCRIPTION = r"""KIND: graph
 <description>
 A triangle on three labelled vertices.
 </description>
 <structure>
-a -- b
-b -- c
-a -- c
+\begin{tikzpicture}
+  \node[circle, draw] (a) at (0,0) {$a$};
+  \node[circle, draw] (b) at (2,0) {$b$};
+  \node[circle, draw] (c) at (1,1.5) {$c$};
+  \draw (a) -- (b);
+  \draw (b) -- (c);
+  \draw (a) -- (c);
+\end{tikzpicture}
 </structure>"""
 
 
@@ -66,7 +71,11 @@ def test_end_to_end(tmp_path, pdf_path, servers):
     assert "Running head" not in md
     assert "$$\nL = D - A\n$$" in md                       # reviewer's fix accepted
     assert "![Figure (page 1)](figures/p0001_b03.png)" in md
-    assert "```text\na -- b" in md                          # graph -> edge list
+    # a graph drawing comes out twice, marked: simple Markdown and TikZ
+    assert "Figure description (generated) — graph as Markdown and as TikZ" in md
+    assert "**Graph — Markdown (simple):** 3 vertices, 3 edges (undirected)" in md
+    assert "  - $a$ — $b$" in md
+    assert "**Graph — TikZ:**\n\n```latex\n\\begin{tikzpicture}" in md
     assert os.path.exists(os.path.join(out, doc_id, "figures", "p0001_b03.png"))
     # the paragraph ending page 1 without punctuation is NOT joined to page 2,
     # because page 2 starts with a header (dropped) and then the same text

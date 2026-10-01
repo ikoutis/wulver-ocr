@@ -5,7 +5,9 @@ Deterministic and CPU-only. Conventions of the output:
     (renders on GitHub, Obsidian, Pandoc, Jupyter, VS Code, MkDocs+arithmatex)
   * tables: GFM when the reader gave GFM, HTML otherwise (merged cells survive)
   * figures: the crop is linked, the generated description follows in a
-    collapsible <details> so the Markdown stays readable
+    collapsible <details> so the Markdown stays readable; a graph drawing
+    carries two marked versions — "Graph — Markdown (simple)" and
+    "Graph — TikZ"
   * running headers/footers/page numbers are dropped (kept in the page JSON)
   * <!-- page N --> comments mark page boundaries for traceability
   * a paragraph split across a page break is re-joined (de-hyphenated when the
@@ -45,8 +47,11 @@ def render_block(b: Block) -> str:
             parts.append(f"![{b.meta.get('alt', 'figure')}]({img})")
         desc = b.meta.get("description") or b.meta.get("reader_description")
         if desc:
-            parts.append("<details><summary>Figure description (generated)"
-                         f"</summary>\n\n{desc.strip()}\n\n</details>")
+            summary = "Figure description (generated)"
+            if b.meta.get("kind") == "graph" and "Graph — TikZ" in desc:
+                summary += " — graph as Markdown and as TikZ"
+            parts.append(f"<details><summary>{summary}</summary>\n\n"
+                         f"{desc.strip()}\n\n</details>")
         if c:                 # some readers transcribe text inside figures
             parts.append(c)
         return "\n\n".join(parts)

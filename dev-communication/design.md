@@ -10,7 +10,8 @@ The emphasis is mathematics. Every display equation should come out as LaTeX tha
 and matches the page symbol for symbol, and inline math should come out as `$...$` in running
 text. Tables should be GFM when they are simple and HTML when they have merged cells. Figures
 should be cropped and linked, with a generated description. For the figure kinds common in our
-papers, the description should carry structure. A drawn graph becomes an edge list, a flowchart
+papers, the description should carry structure. A drawn graph comes out **twice, marked as
+such**: as simple Markdown (vertex list and edge list) and as TikZ that redraws it. A flowchart
 becomes Mermaid, and a commutative diagram becomes tikz-cd.
 
 The pipeline must run in batch on Wulver's SLURM setup, using the same conventions as the dml
@@ -18,8 +19,10 @@ repo: a conda env on `/project`, pre-staged weights, `qos=low` arrays that reque
 and one-line recovery. It should also work interactively on a single paper. Everything is
 self-hosted. No paper and no page image leaves the cluster.
 
-Out of scope for v0: handwriting, non-Latin scripts, chemistry (SMILES), and reconstructing a
-compilable `.tex` file. Markdown with LaTeX math is the target.
+Out of scope for v0: handwriting, non-Latin scripts, and chemistry (SMILES). **Markdown with
+LaTeX math is the target.** A compilable `.tex` export is deferred to later, per Ioannis
+([O-003]). Choices made now keep that door open: math stays verbatim LaTeX, and graphs are
+already TikZ.
 
 ## 2. Why two models
 
@@ -341,9 +344,21 @@ VS Code, and MkDocs with arithmatex:
 - Headings are `#` for the title and `##`/`###` for sections.
 - Each figure is `![alt](figures/p0003_b05.png)` followed by a collapsible
   `<details><summary>Figure description (generated)</summary>`. Inside it are a kind, a
-  description, and, where the kind has structure, a fenced block: an edge list in `text`,
-  `mermaid`, or tikz-cd in `latex`. Generated descriptions are always marked as generated and
-  never replace the crop.
+  description, and, where the kind has structure, the structure: Mermaid for a flowchart,
+  tikz-cd in a `latex` fence for a commutative diagram. Generated descriptions are always
+  marked as generated and never replace the crop.
+- **Graph drawings get two marked versions of the same graph:**
+  - `**Graph — Markdown (simple):**`, a vertex list plus one bullet per edge (`—`
+    undirected, `→` directed, `↔` both, edge labels in parentheses);
+  - `**Graph — TikZ:**`, a `latex` fence with a `tikzpicture` that redraws the vertices at
+    their drawn positions.
+
+  The reviewer writes only the TikZ, in a fixed pattern (`src/tikz.py`), and the pipeline
+  parses it back. The parsed vertices and edges go into the page JSON (`meta["graph"]`), and the
+  Markdown version is rendered from them, so the two cannot disagree. TikZ that does not parse,
+  or whose edges reference undeclared vertices, is sent back to the reviewer once with the
+  problems listed. If it still fails, the figure is flagged (`tikz_*`) and the Markdown version
+  says it is unavailable.
 - `<!-- page N -->` comments mark page boundaries (invisible when rendered; `--no-page-markers`
   turns them off).
 - Running headers, footers, and page numbers are dropped from the Markdown but kept in the JSON.
@@ -378,7 +393,9 @@ for ~20 pages) checks that the synthetic degradation is not flattering. The publ
     penalising `\frac{a}{b}` vs `{a \over b}`.
 - Tables: TEDS.
 - Text: normalised edit distance and reading-order accuracy.
-- Figures: crop recall, and for graph drawings, edge-list exact match.
+- Figures: crop recall. For graph drawings, exact match of the edge set parsed back from the
+  TikZ: by vertex label, or up to isomorphism when the drawing has no labels. arXiv sources that
+  draw their graphs in TikZ give exact ground truth for this.
 - Footnotes: recall. olmOCR-Bench rewards dropping headers and footers, and readers tuned on it
   may drop footnotes with them.
 - Cost: GPU-seconds per page per stage.
@@ -417,21 +434,18 @@ maximise net formula accuracy. Because of degrading levels, this can be done per
 | M2 | evaluation set + metrics | arXiv-source builder (`eval/build_arxiv.py`), formula normaliser, CDM via a headless KaTeX render, TEDS, edit distance; A0 vs A1 on ~50 papers × 4 degradation levels | — |
 | M3 | bake-off + calibration | A2–A5; pick the default reader/reviewer pair from data; calibrate the gate thresholds | — |
 | M4 | production | the real corpus in sharded arrays; a single-paper command for interactive use (OnDemand session) | — |
-| later | | document-level pass (heading hierarchy, cross-page macros and references), born-digital text-layer hints, `.tex` export | — |
+| later | | document-level pass (heading hierarchy, cross-page macros and references), born-digital text-layer hints, compilable `.tex` export (deferred, [O-003]), an optional `pdflatex` compile check for the TikZ | — |
 
 ## 9. Open questions for Ioannis
 
 1. **Corpus.** What are we converting first, and how much of it? Era and scan quality (300 dpi
    office scans or old photocopies), languages, and page count all matter. They set the shard
    size and whether robustness to older typography is a priority.
-2. **"Graphs and diagrams."** I read this as both *graph drawings* (vertices and edges, which get
-   an edge list) and *plots* (which get axes, series, and trends), plus flowcharts (Mermaid) and
-   commutative diagrams (tikz-cd). Is an edge list the right structured form for graph drawings,
-   or would TikZ (or a GraphML/JSON node-edge dump) serve better?
-3. **Output target.** Is Markdown for reading and search (Obsidian, GitHub, LLM ingestion)
-   enough? Or should M4 also produce compilable `.tex` or HTML?
-4. **Allocation.** Should we use `ikoutis`/`low` as in dml (free, preemptable; the default
-   here) or `dept_dms`/`high_dept_dms`?
+2. ~~**"Graphs and diagrams."**~~ *Answered ([O-003]):* graph drawings come out as TikZ,
+   **and** as simple Markdown, the two marked as such (§6).
+3. ~~**Output target.**~~ *Answered ([O-003]):* Markdown. Compilable LaTeX can wait.
+4. ~~**Allocation.**~~ *Answered ([O-003]):* `ikoutis` / `qos=low`, as in dml (already the
+   script default).
 5. **Real-scan ground truth.** Are there ~20 printed pages (ideally old, math-dense) that someone
    could check by hand, to validate the synthetic degradations?
 6. **Licences.** Everything runs in-house and nothing is redistributed. Still, the default

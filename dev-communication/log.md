@@ -11,6 +11,36 @@ the entry it answers.
 
 ---
 
+## 2026-10-01 — Note [O-003]: decisions from Ioannis — TikZ graphs, Markdown target, qos=low
+
+Ioannis answered three of the open questions in `design.md` §9.
+
+**Graph drawings come out twice, marked as such.** The first version is simple Markdown: a
+vertex list and one bullet per edge, with arrows for direction and edge labels in parentheses.
+The second is TikZ: a `tikzpicture` that redraws the vertices at their drawn positions.
+
+The reviewer is asked only for the TikZ, in a fixed pattern (`src/tikz.py`). The pipeline then
+parses it back and renders the Markdown version from the parsed vertices and edges. That means
+the two versions cannot disagree. It also means the graph is available as data in the page JSON
+(`meta["graph"]`), which is what the evaluation will score against ground truth.
+
+TikZ that fails to parse, or that draws an edge to a vertex it never declared, is sent back to
+the reviewer once with the problems listed. If it still fails, the figure is flagged in
+`report.json`, and the Markdown version says it is unavailable rather than guessing. Flowcharts
+stay Mermaid, because it renders on GitHub. Commutative diagrams stay tikz-cd.
+
+**Markdown is the target.** A compilable LaTeX export can wait. It stays on the "later" row of
+the milestones. Math is kept verbatim as LaTeX, and graphs are already TikZ, so nothing done now
+will need redoing for it.
+
+**The allocation is `ikoutis` with `qos=low`**, as in dml. It was already the default in
+`slurm/ocr.sbatch`, so nothing changes.
+
+Still open: the target corpus (question 1), a hand-checked set of real scans (5), and licences
+(6).
+
+---
+
 ## 2026-10-01 — Task [O-002]: first smoke run on Wulver (M1)
 
 **For:** whoever has a Wulver login under `ikoutis`. **Why:** everything in [O-001] has been
@@ -66,8 +96,8 @@ working version of the pipeline is on `main`. In short:
 
 - display math as `$$…$$` LaTeX and inline math as `$…$`;
 - tables as GFM, or HTML when cells are merged;
-- figures cropped, linked, and described. A graph drawing also gets an edge list, a flowchart
-  gets Mermaid, and a commutative diagram gets tikz-cd.
+- figures cropped, linked, and described. A flowchart also gets Mermaid, and a commutative
+  diagram gets tikz-cd. *(Graph drawings: see [O-003] — Markdown and TikZ, marked.)*
 
 **How: two models with a gate between them.**
 

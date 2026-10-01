@@ -2,8 +2,9 @@
 
 A self-hosted OCR pipeline for research papers: scans (or PDFs) in,
 Markdown out, with display and inline math as LaTeX, tables as GFM/HTML, and
-figures cropped, linked, and described. Graph drawings get an edge list,
-diagrams get Mermaid, and commutative diagrams get tikz-cd.
+figures cropped, linked, and described. Graph drawings come out twice, marked
+as such: as simple Markdown (vertex and edge lists) and as TikZ. Diagrams get
+Mermaid, and commutative diagrams get tikz-cd.
 
 It pairs two models that are good at different things:
 
@@ -37,6 +38,7 @@ src/
   ├── katex_check.py  optional KaTeX parse of every formula (persistent node worker)
   ├── review.py       stage-2 gated proofreading (prompts, gate, provenance)
   ├── figures.py      figure crops + generated descriptions / structure
+  ├── tikz.py         graph TikZ: canonical form, parser, checks, Markdown rendering
   ├── assemble.py     blocks → Markdown (running heads dropped, page-break joins)
   ├── backend.py      OpenAI-compatible HTTP client (talks to `vllm serve`)
   ├── schema.py       Page / Block data model (the JSON every stage reads/writes)
@@ -112,7 +114,8 @@ the reader only).
 
 ```
 out/<doc_id>/
-  <doc_id>.md      Markdown: $..$ / $$..$$ math, <!-- page N --> markers
+  <doc_id>.md      Markdown: $..$ / $$..$$ math, <!-- page N --> markers;
+                   graph drawings as "Graph — Markdown (simple)" + "Graph — TikZ"
   figures/*.png    figure crops, linked from the Markdown
   report.json      per-document summary: block types, review decisions,
                    remaining flags (where a human should look first)

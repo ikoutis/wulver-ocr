@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# pipeline data never goes in git: inputs may be copyrighted, page images are
+# large, and outputs live on /project (see slurm/ocr.sbatch defaults)
+work/
+out/
+*.pdf
+
+# SLURM stdout/stderr and vLLM server logs
+logs/
+
+# local model snapshots, if anyone stages into the repo by mistake
+models/

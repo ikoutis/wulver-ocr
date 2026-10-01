@@ -25,7 +25,7 @@ compilable `.tex` file. Markdown with LaTeX math is the target.
 
 Two families of model now do document OCR well, and they fail in complementary ways.
 
-**Specialist document-OCR models** (~1–3B parameters, trained on page→structure data) read a
+**Specialist document-OCR models** (~1–4B parameters, trained on page→structure data) read a
 whole page in one pass. They produce layout boxes, reading order, text, LaTeX, and HTML tables.
 They are fast (roughly a page per second on an A100) and stay close to the pixels. Their
 characteristic failures are of a few known kinds:
@@ -38,18 +38,22 @@ characteristic failures are of a few known kinds:
 - **Mis-split tables.**
 - **No understanding of figures.** They box a figure but cannot say what it shows.
 
-**General VLMs** (~30B, instruction-tuned) are slower and less pixel-faithful on a full page,
+**General VLMs** (~27–32B, instruction-tuned) are slower and less pixel-faithful on a full page,
 but they are good at a different job: *comparing* a transcription with an image and spotting the
 mismatch. They can also describe a figure. Their characteristic failure is fluency. Asked to
 transcribe, they paraphrase, "improve" unusual notation, and silently complete what they cannot
-read.
+read. This has been measured, not just observed. One 2026 study found that on perturbed input,
+general VLMs' word error rate rose by up to 6.9 points, against 0.1–3.4 for OCR-specialised
+VLMs (arXiv 2607.21617†).
 
 The design gives each model the job it is good at and contains each one's failure mode.
 
 1. The **reader** (specialist) reads every page.
 2. Deterministic **validators** (CPU) check every block. They look for LaTeX structure
    (braces, `\begin`/`\end`, `\left`/`\right`, stray delimiters), repetition loops, truncation,
-   unbalanced inline `$`, and inconsistent table shapes.
+   unbalanced inline `$`, and inconsistent table shapes. They also check that **KaTeX can parse
+   every formula**. KaTeX is the renderer olmOCR-Bench grades math with, and the one GitHub and
+   Obsidian display it with.
 3. The **reviewer** (generalist) sees only what needs it. That means every display formula (the
    project's emphasis, so all of them are reviewed by default), every flagged block, and every
    figure. Each request carries **one image crop plus the reader's draft**. The reviewer answers
@@ -80,7 +84,23 @@ The alternatives considered:
   matter for papers.
 - **Two independent readings with adjudication** (specialist and generalist each read every
   formula, and the VLM picks between them). It is more expensive. It is kept as an evaluation
-  arm (A4) to test whether proofreading leaves accuracy on the table.
+  arm (A4a) to test whether proofreading leaves accuracy on the table.
+- **Two specialists, with escalation on disagreement.** Two architecturally different readers
+  both read every page, and only blocks where they disagree go to the reviewer, with both
+  candidates. This is the routing idea behind Consensus Entropy (CVPR 2026†): multi-model
+  agreement sent just 7.3% of inputs to the stronger model and beat VLM-as-judge by 15 F1
+  points. It roughly doubles stage-1 cost, but stage 1 is the cheap stage. It is arm A4b, and
+  the strongest candidate to become the default if it wins. Our adapters already put both
+  readers' output in the same block schema, so the extra code is block alignment and a
+  comparison.
+
+Related evidence for the proofreading loop: OCR-EDR (arXiv 2609.03445†) runs edit → render →
+reassess on formula crops. It fixes 86% of erroneous inputs and adds up to 4.6 CDM on the hard
+subsets of four OCR systems. Our gate is the cheap first version of that loop (structure + KaTeX
+parse + bounded change). A render-and-compare check is the natural next validator (M3).
+
+*(† = read by our survey from search snippets or abstracts, not from the full paper; to be
+confirmed before we cite it in anything.)*
 
 ## 3. Architecture
 
@@ -117,9 +137,14 @@ history.
 
 **Readers are adapters** (`src/readers/`). Each one maps a model's native output onto the common
 block vocabulary: title, heading, text, list, formula, table, figure, caption, footnote,
-header, footer, page_number, code, reference, other. Two are implemented:
+header, footer, page_number, code, reference, other. Three are implemented:
 
-- `dots`: layout JSON with boxes (the dots.ocr output format).
+- `chandra`: HTML layout blocks with boxes (Chandra OCR 2). Math comes back in `<math>` tags,
+  which `src/readers/htmlmd.py` converts to `$…$`/`$$…$$`. A trailing equation number becomes
+  `\tag{n}`. The model's own figure description, including Mermaid for diagrams, is kept
+  alongside ours.
+- `dots`: layout JSON with boxes (the dots.ocr / dots.mocr format, prompt verified against the
+  dots.mocr repository).
 - `markdown`: whole-page Markdown, split back into blocks. It works for olmOCR-style models or
   any VLM. There are no boxes, so the reviewer sees the full page and figures are not cropped.
 
@@ -127,12 +152,103 @@ Adding a model means adding one adapter module and one profile.
 
 ## 4. Model choices
 
-*Provisional.* The default pair in [`profiles/default.sh`](../profiles/default.sh) is
-**dots.ocr** (reader: a 1.7B layout-plus-content model that produces boxes, LaTeX, and HTML
-tables in one pass, served natively by vLLM) and **Qwen3-VL-32B-Instruct** (reviewer: Apache
-2.0, strong on LaTeX and documents, fits one A100-80GB in bf16). A survey of the late-2026
-candidates, with current benchmark numbers, will replace this paragraph. Adapters are cheap,
-so the choice is revisable from data (§7, arm A5).
+**How these were chosen.** A survey on 2026-10-01 read the project READMEs and leaderboards on
+GitHub. Hugging Face and arXiv were not reachable from the survey's sandbox. I then re-checked
+against primary sources the facts the defaults rest on: Chandra 2's and dots.mocr's prompts,
+output formats, and licences; Qwen3.8's release and serving instructions; and vLLM's CUDA
+wheels. Numbers marked † come from search snippets and are unconfirmed. "n/r" means not
+reported.
+
+**The landscape, briefly.**
+
+- The best page readers are now 0.8–4B specialists.
+- Standalone formula recognizers (UniMERNet, PP-FormulaNet) are no longer competitive as the
+  main path. On OmniDocBench v1.6, a classic detector-plus-formula-recognizer pipeline scores
+  CDM 83, against 97+ for the region VLMs.
+- **The leaderboards disagree, and the disagreement matters for us.**
+  - OmniDocBench v1.6 is mostly clean pages. It also ignores headers, footers, and footnotes.
+  - PureDocBench (May 2026) adds digitally and physically degraded tracks of the same pages.
+    It reorders the field. PaddleOCR-VL-1.6 is third on OmniDocBench (96.34; an independent
+    rerun gives 95.25) but averages 59.3 on PureDocBench, and 54.2 on real degradation.
+  - olmOCR-Bench has an "old scans math" category: printed math, scanned. It is the closest
+    public proxy for our inputs.
+- Even the best systems score only about 51–58 on olmOCR-Bench's general "old scans" category.
+  Old scans are not solved by anyone.
+
+**Readers (stage 1).**
+
+| model | size | licence (weights) | boxes | olmOCR-Bench overall / old-scans-math | OmniDocBench v1.6 | PureDocBench avg (real-degraded) | here |
+|---|---|---|---|---|---|---|---|
+| **Chandra OCR 2** (Datalab, 2026-03) | 4B | modified OpenRAIL-M: free for research/personal use ✓ | yes (0–1000) | **85.8 / 89.1** ✓ | n/r | n/r | **default** (`chandra`) |
+| **dots.mocr** (rednote, 2026-03) | 3B | MIT ✓ | yes (pixels) | 83.9 / 85.5 ✓ | n/r (dots.ocr: 90.8) | 70.4 | profile `dots` (`dots`) |
+| Infinity-Parser2-Flash (2026-05) | 2B | Apache-2.0† | yes (JSON) | 86.0 | 92.0 (self) | n/r | candidate (A5) |
+| TeleOCR (China Telecom, 2026-08/09) | 1.2B | unclear: no licence file | yes | n/r | **96.91** | **78.6 (69.1)** | candidate once the licence is clear |
+| WeVisDoc-4B (Tencent, 2026-09) | 4B | Apache-2.0† | no | n/r | 95.4 (self)† | 75.6 (69.1) | candidate (`markdown`) |
+| OvisOCR2 (Alibaba, 2026-07) | 0.8B | Apache-2.0 | no | n/r | 96.47 | 75.1 (66.5) | candidate (`markdown`) |
+| MinerU2.5-Pro (2026-04/05) | 1.2B | Apache-2.0† (toolkit: custom) | yes | n/r | 95.75 | 70.1 (62.6) | candidate (needs adapter) |
+| PaddleOCR-VL-1.6 (2026-05) | 0.9B + detector | Apache-2.0 | yes | n/r | 96.34 | 59.3 (54.2) | not chosen: weakest under degradation |
+| olmOCR-2 (Ai2, 2025-10) | 7B | Apache-2.0 | no | 82.4 / 82.3 | 85.7 | 63.8 | baseline (`markdown`) |
+
+✓ = checked against the project's own repository.
+
+**Default reader: Chandra OCR 2.** Three reasons:
+
+1. It has the best published score on the category closest to our inputs: 89.1 on old scans
+   with math, against 85.5 for the next open model.
+2. It returns layout boxes with a 19-label vocabulary. That vocabulary includes Equation-Block,
+   Diagram, Bibliography, and Page-Header/Footer, so figures can be cropped and running heads
+   dropped.
+3. It already describes images, turns charts into data, and turns diagrams into Mermaid. That
+   complements the reviewer's figure pass.
+
+The adapter uses Chandra's own prompt, image scaling, and decoding settings, copied from its
+Apache-2.0 code. The trade-offs:
+
+- **The weights licence.** It is fine for research. It is not fine for commercial use or for use
+  that competes with Datalab's API (question 6 in §9).
+- **It is not on PureDocBench.** So its robustness to *real* degradation is known only through
+  olmOCR-Bench.
+- **It is larger than the 1B models.** Datalab measures 1.44 pages/s on an H100 on a hard mix.
+  Expect about 1 page/s on an A100.
+
+**dots.mocr** is the MIT-licensed alternative (`WOCR_PROFILE=dots`). It is two points behind on
+olmOCR-Bench, its adapter is the same code, and it is reader B for arm A4b.
+
+**Leading on clean pages is not enough.** The OmniDocBench leaders (TeleOCR, OvisOCR2,
+PaddleOCR-VL) were not taken on that score alone. TeleOCR is also the strongest specialist on
+PureDocBench, and it will join the bake-off (A5) once its licence is published.
+
+**Reviewer (stage 2): Qwen3.8-27B** (Qwen, 2026-08-14; ✓ release and serving instructions).
+
+- It is a unified vision-language model.
+- It is a 27B dense hybrid: Gated-DeltaNet layers plus full attention. The hybrid layers keep
+  the KV cache small, so in bf16 (~56 GB) it fits one A100-80GB with room for batching.
+- It has the best open general-model score on PureDocBench, 77.6 (73.6 on the real-degraded
+  track). That is above every specialist on that track, and judging degraded crops is exactly
+  the reviewer's job.
+- It is served with `--reasoning-parser qwen3`. Thinking is off by default (one short comparison
+  per crop). The profile sets this through `EDITOR_REQUEST_EXTRA`, and whether thinking buys
+  formula accuracy is an M3 measurement.
+- The client also strips any inline `<think>` text, so a misconfigured server cannot leak
+  reasoning into the output.
+- Licence: per its model card; the survey reports Apache-2.0†.
+
+The fallback is Qwen3-VL-32B-Instruct (Apache-2.0, standard attention, the most mature vLLM path
+on Ampere) in `WOCR_PROFILE=conservative`. Not chosen:
+
+- GLM-5.3-Flash. It scores best on PureDocBench (79.7), but vLLM runs its sparse attention only
+  on Hopper/Blackwell, and the community A100 port needs 8 GPUs.
+- gpt-oss. It is text-only, so it cannot compare a draft against an image.
+- Qwen3.5-122B. It needs 4 GPUs, or int4.
+
+**A100 specifics.**
+
+- bf16 is native; FP8 checkpoints run only weight-only (Marlin), and FP8 on hybrid and MoE
+  models has open issues. Hence bf16 everywhere.
+- The hybrid Qwen models need vLLM ≥ 0.17.
+- vLLM's default wheels are built for CUDA 12.9, with 12.8 and 13.0 builds also published
+  (✓ vLLM install docs).
+- `tools/setup_env.sh` installs the cu129 build by default (`WOCR_TORCH_BACKEND` overrides it).
 
 ## 5. Running on Wulver
 
@@ -154,8 +270,8 @@ so the choice is revisable from data (§7, arm A5).
 3. starts the reviewer server and runs `review`, then stops it;
 4. assembles the Markdown.
 
-Each model gets the whole 80 GB, which goes to KV cache and therefore batch size. A ~30B bf16
-reviewer (~62–66 GB of weights) fits on one card. Co-locating it with the reader would not fit
+Each model gets the whole 80 GB, which goes to KV cache and therefore batch size. The 27B bf16
+reviewer (~56 GB of weights) fits on one card. Co-locating it with the reader would not fit
 comfortably. The cost of phasing is one server start per phase (1–3 min with warm caches), so
 shards should be sized to run for hours. A phase with nothing left to do starts no server at
 all.
@@ -183,7 +299,7 @@ The reviewer needs a full card.
 | what | where | why |
 |---|---|---|
 | conda env | `/project/ikoutis/conda_env/wocr` | same convention as dml (`tools/setup_env.sh`) |
-| model weights | `/project/ikoutis/wocr_models/<name>` | persistent (scratch purges after 30 days); ~70 GB for the default pair, inside the 2 TB group quota |
+| model weights | `/project/ikoutis/wocr_models/<name>` | persistent (scratch purges after 30 days); ~65 GB for the default pair, inside the 2 TB group quota |
 | page images, page JSON | `/scratch/ikoutis/$USER/wocr/work` | large (1–3 MB per page at 200 dpi), regenerable |
 | Markdown, figures, reports | `/project/ikoutis/$USER/wocr/out` | the product; backed up |
 
@@ -201,7 +317,7 @@ docker://vllm/vllm-openai:<tag>` on a compute node).
 
 **Throughput (to be measured in [O-002]).** The rough expectation for one A100:
 
-- the reader at ~1–2 pages/s;
+- the reader at ~1 page/s for Chandra 2, more for the smaller readers;
 - the reviewer on ~5–15 crops per page of a math paper, at a few crops per second with batching.
 
 That puts a 20-page paper at about a minute of GPU time end to end, and 10,000 pages at a few
@@ -263,6 +379,8 @@ for ~20 pages) checks that the synthetic degradation is not flattering. The publ
 - Tables: TEDS.
 - Text: normalised edit distance and reading-order accuracy.
 - Figures: crop recall, and for graph drawings, edge-list exact match.
+- Footnotes: recall. olmOCR-Bench rewards dropping headers and footers, and readers tuned on it
+  may drop footnotes with them.
 - Cost: GPU-seconds per page per stage.
 
 **Arms.** All arms run on the same pages, so the comparisons are paired.
@@ -273,7 +391,8 @@ for ~20 pages) checks that the synthetic degradation is not flattering. The publ
 | A1 | specialist | formulas + flagged (default) | does proofreading help, and where? |
 | A2 | specialist | every block | is reviewing unflagged text worth its cost? |
 | A3 | generalist reads whole pages | — | is a specialist needed at all? |
-| A4 | specialist + generalist both read each formula | adjudicates | does independent reading beat proofreading? |
+| A4a | specialist + generalist both read each formula | adjudicates | does independent reading beat proofreading? |
+| A4b | two specialists (Chandra 2 + dots.mocr) read every page | sees only blocks where they disagree, with both candidates | does consensus routing beat validator routing, at what cost? |
 | A5 | the other specialist candidates (§4) | as A1 | reader choice, under the same reviewer |
 
 **Gate calibration.** For A1/A2, take every proposal with its draft, the ground truth, and its
@@ -293,7 +412,7 @@ maximise net formula accuracy. Because of degrading levels, this can be done per
 
 | # | milestone | content | entry |
 |---|---|---|---|
-| M0 | scaffold *(this commit)* | pipeline, two reader adapters, gated reviewer, figure describer, assembly, Wulver tooling, 70+ CPU tests | [O-001] |
+| M0 | scaffold *(this commit)* | pipeline, three reader adapters (Chandra 2, dots, Markdown), gated reviewer, KaTeX validator, figure describer, assembly, Wulver tooling, 86 CPU tests | [O-001] |
 | M1 | smoke run on Wulver | env + weights staged; 3–5 papers end to end; measured pages/s, GPU memory, review decisions; fix whatever the real models do differently from their docs (prompt formats, box frames, served names) | [O-002] |
 | M2 | evaluation set + metrics | arXiv-source builder (`eval/build_arxiv.py`), formula normaliser, CDM via a headless KaTeX render, TEDS, edit distance; A0 vs A1 on ~50 papers × 4 degradation levels | — |
 | M3 | bake-off + calibration | A2–A5; pick the default reader/reviewer pair from data; calibrate the gate thresholds | — |
@@ -315,6 +434,9 @@ maximise net formula accuracy. Because of degrading levels, this can be done per
    here) or `dept_dms`/`high_dept_dms`?
 5. **Real-scan ground truth.** Are there ~20 printed pages (ideally old, math-dense) that someone
    could check by hand, to validate the synthetic degradations?
-6. **Licences.** Everything runs in-house and nothing is redistributed. Still, some candidate
-   readers carry AGPL-style or custom licences (see §4). Confirm this is fine for research use,
-   or restrict to Apache/MIT models.
+6. **Licences.** Everything runs in-house and nothing is redistributed. Still, the default
+   reader's weights (Chandra 2) are under a modified OpenRAIL-M licence, which is free for
+   research and personal use but not for commercial use or use competing with Datalab's API.
+   Is research use the only use we foresee? If not, the MIT pair is `WOCR_PROFILE=dots`. (Other
+   candidates are also out unless the answer changes: HunyuanOCR's licence excludes the EU,
+   UK, and Korea and forbids using its outputs to improve other models.)

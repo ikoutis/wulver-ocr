@@ -7,9 +7,11 @@
 #
 # Usage (after sourcing a profile, see profiles/):
 #   source slurm/serve_lib.sh
-#   start_server reader "$WOCR_MODELS/$READER_NAME" 8001 "${READER_VLLM_ARGS[@]}"
+#   start_server "$READER_NAME" "$WOCR_MODELS/$READER_NAME" 8001 "${READER_VLLM_ARGS[@]}"
 #   ... python -m src.run_ocr read --reader-url http://127.0.0.1:8001 ...
-#   stop_server reader
+#   stop_server "$READER_NAME"
+# The first argument is also the served model name, so it is what every
+# block's provenance ("reader:chandra:chandra_ocr_2") records.
 # An EXIT trap stops anything still running, so a failed stage never leaves
 # an orphaned server holding the GPU.
 

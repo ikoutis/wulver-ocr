@@ -9,10 +9,12 @@ means adding a module here and a line to READERS.
 from __future__ import annotations
 
 from .base import Reader
+from .chandra import ChandraReader
 from .dots import DotsReader
 from .markdown import PageMarkdownReader
 
 READERS: dict[str, type[Reader]] = {
+    ChandraReader.name: ChandraReader,
     DotsReader.name: DotsReader,
     PageMarkdownReader.name: PageMarkdownReader,
 }

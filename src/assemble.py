@@ -43,7 +43,7 @@ def render_block(b: Block) -> str:
         img = b.meta.get("image")
         if img:
             parts.append(f"![{b.meta.get('alt', 'figure')}]({img})")
-        desc = b.meta.get("description")
+        desc = b.meta.get("description") or b.meta.get("reader_description")
         if desc:
             parts.append("<details><summary>Figure description (generated)"
                          f"</summary>\n\n{desc.strip()}\n\n</details>")

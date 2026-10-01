@@ -15,7 +15,9 @@
 #   INPUTS      REQUIRED. dir(s), PDF/image file(s), or @listfile, space-separated
 #   OUT         Markdown output root   (default /project/ikoutis/$USER/wocr/out)
 #   WORK        page images + JSON     (default /scratch/ikoutis/$USER/wocr/work)
-#   WOCR_PROFILE  model pair in profiles/<name>.sh   (default: default)
+#   WOCR_PROFILE  model pair in profiles/<name>.sh: default (Chandra 2 +
+#               Qwen3.8-27B), dots (dots.mocr, MIT), conservative
+#   REVIEW_ARGS extra review flags, e.g. "--review-types formula,table"
 #   PHASES      subset of "read review assemble"     (default: all three)
 #   NSHARDS     shards in total (default: the array size; set it when you
 #               resubmit only some indices, e.g. via tools/incomplete.py)
@@ -29,7 +31,7 @@
 #   INPUTS=paper.pdf bash slurm/ocr.sbatch           # one shard, same phases
 #
 # Throughput planning (to be measured, see dev-communication/design.md §8):
-# a ~1–3B reader does roughly 1 page/s on an A100; the reviewer only sees
+# a 3–4B reader does roughly 1 page/s on an A100; the reviewer only sees
 # formulas, flagged blocks and figures. Size shards at a few thousand pages
 # so each task spends minutes, not most of its time, starting servers.
 # =============================================================================
@@ -88,19 +90,21 @@ requeue_if_signalled
 has_phase() { [[ " $PHASES " == *" $1 "* ]]; }
 
 if has_phase read && [ "$(python -m src.run_ocr todo --stage read "${COMMON[@]}" | tail -n1)" != 0 ]; then
-    start_server reader "$WOCR_MODELS/$READER_NAME" 8001 "${READER_VLLM_ARGS[@]}"
+    start_server "$READER_NAME" "$WOCR_MODELS/$READER_NAME" 8001 "${READER_VLLM_ARGS[@]}"
     run_with_requeue python -m src.run_ocr read "${COMMON[@]}" \
         --reader "$READER_ADAPTER" --reader-url http://127.0.0.1:8001 \
-        --reader-model reader --workers "${READER_WORKERS:-64}"
-    stop_server reader
+        --reader-model "$READER_NAME" --reader-extra "${READER_REQUEST_EXTRA:-}" \
+        --workers "${READER_WORKERS:-64}"
+    stop_server "$READER_NAME"
 fi
 
 if has_phase review && [ "$(python -m src.run_ocr todo --stage review "${COMMON[@]}" | tail -n1)" != 0 ]; then
-    start_server editor "$WOCR_MODELS/$EDITOR_NAME" 8002 "${EDITOR_VLLM_ARGS[@]}"
+    start_server "$EDITOR_NAME" "$WOCR_MODELS/$EDITOR_NAME" 8002 "${EDITOR_VLLM_ARGS[@]}"
     run_with_requeue python -m src.run_ocr review "${COMMON[@]}" \
-        --editor-url http://127.0.0.1:8002 --editor-model editor \
+        --editor-url http://127.0.0.1:8002 --editor-model "$EDITOR_NAME" \
+        --editor-extra "${EDITOR_REQUEST_EXTRA:-}" \
         --workers "${EDITOR_WORKERS:-32}" ${REVIEW_ARGS:-}
-    stop_server editor
+    stop_server "$EDITOR_NAME"
 fi
 
 if has_phase assemble; then

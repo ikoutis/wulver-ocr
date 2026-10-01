@@ -25,7 +25,7 @@ scale. It also replaces the throughput guesses in `design.md` §5 with measureme
 bash tools/setup_env.sh                                  # login node; ~15 min
 # GPU check: the srun one-liner in tools/setup_env.sh's header (debug_gpu, free).
 # Paste its output. The driver's max CUDA version decides the vLLM wheel.
-python tools/stage_models.py --profile default           # ~70 GB to /project/ikoutis/wocr_models
+python tools/stage_models.py --profile default           # ~65 GB to /project/ikoutis/wocr_models
 pytest tests/                                            # CPU, seconds
 
 mkdir -p /project/ikoutis/$USER/wocr/o002_in
@@ -39,7 +39,8 @@ OUT=/project/ikoutis/$USER/wocr/runs/o002_smoke \
 **Report back:**
 
 1. The `nvidia-smi` line printed at the top of `logs/wocr_<job>_0.log`, plus torch, CUDA, and
-   vLLM versions (from `/project/ikoutis/conda_env/wocr/wocr.lock.txt`).
+   vLLM versions (from `/project/ikoutis/conda_env/wocr/wocr.lock.txt`), and whether
+   `setup_env.sh`'s sanity line said `katex check: True`.
 2. Server start-up times (`=== reader ready after …s`) and the `read:`/`review` summary lines
    (pages, seconds, review decisions).
 3. For each paper, `report.json`'s `review` and `open_flags` counts. Also a look at the Markdown
@@ -47,6 +48,9 @@ OUT=/project/ikoutis/$USER/wocr/runs/o002_smoke \
    pages, and whether figures were cropped and described sensibly.
 4. Any traceback in `logs/*.err` or the `logs/vllm_*.log` files. If a server failed to start,
    the last 40 lines of its log are copied into the `.err`.
+5. If the reviewer (Qwen3.8-27B, a hybrid-attention model) fails to start or misbehaves on the
+   A100s, rerun the same three papers with `WOCR_PROFILE=conservative` (dots.mocr +
+   Qwen3-VL-32B). Report both runs. That is also a first, informal reader comparison.
 
 No numbers are expected to be final here. The point is that the plumbing works with the real
 models, and a list of what to fix before M2.
@@ -93,10 +97,17 @@ Each array task serves one model at a time on a full A100, so each model gets al
 
 **Status.**
 
-- 67 CPU-only tests pass. They include end-to-end runs against fake model servers, resume
-  without rework, and the exit-85 signal path.
+- 86 CPU-only tests pass. They include end-to-end runs against fake model servers, resume
+  without rework, the exit-85 signal path, and the KaTeX check (3 tests skip without node).
+- The validators include a KaTeX parse of every formula (the renderer olmOCR-Bench grades
+  math with).
 - Nothing has run on a GPU yet. That is [O-002].
-- The default model pair is provisional until the survey in `design.md` §4 and the smoke run.
+- The default pair is **Chandra OCR 2** (reader) and **Qwen3.8-27B** (reviewer). Chandra 2
+  has the best published score on scanned math (olmOCR-Bench "old scans math", 89.1). Qwen3.8
+  is the strongest open general model on degraded documents (PureDocBench) that fits one A100.
+  `design.md` §4 has the survey behind the choice, the alternatives, and the one licence caveat:
+  Chandra's weights are free for research, not for commercial use. `WOCR_PROFILE=dots` swaps in
+  the MIT-licensed dots.mocr.
 - The evaluation plan (§7) builds exact ground truth from arXiv LaTeX sources plus seeded scan
   degradation (`eval/degrade.py`). That is what will tell us, in numbers, whether the second
   model earns its GPU time.

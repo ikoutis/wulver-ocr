@@ -171,8 +171,10 @@ def _read_one(reader, doc_dir: str, idx: int, retries: int) -> Page:
 
 
 def stage_read(args):
-    client = ChatClient(args.reader_url, args.reader_model, timeout=args.timeout)
-    reader = get_reader(args.reader)(client, max_tokens=args.reader_max_tokens)
+    client = ChatClient(args.reader_url, args.reader_model, timeout=args.timeout,
+                        default_extra=_json_arg(args.reader_extra))
+    kw = {} if args.reader_max_tokens is None else {"max_tokens": args.reader_max_tokens}
+    reader = get_reader(args.reader)(client, **kw)
     log(f"reader {reader.tag} @ {args.reader_url}")
     docs = select_docs(args)
     todo = []
@@ -192,7 +194,8 @@ def stage_read(args):
 
 
 def stage_review(args):
-    client = ChatClient(args.editor_url, args.editor_model, timeout=args.timeout)
+    client = ChatClient(args.editor_url, args.editor_model, timeout=args.timeout,
+                        default_extra=_json_arg(args.editor_extra))
     tag = f"reviewer:{client.model}"
     policy = ReviewPolicy(
         review_types=set(filter(None, args.review_types.split(","))),
@@ -304,6 +307,18 @@ def stage_todo(args):
     return n
 
 
+def _json_arg(s: str | None) -> dict:
+    if not s:
+        return {}
+    try:
+        d = json.loads(s)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"bad JSON {s!r}: {e}")
+    if not isinstance(d, dict):
+        raise SystemExit(f"expected a JSON object, got {s!r}")
+    return d
+
+
 def _report_failures(stage, items, results):
     for it, r in zip(items, results):
         if isinstance(r, Stopped):
@@ -335,13 +350,17 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--reader", default="dots", choices=sorted(READERS))
         p.add_argument("--reader-url", default="http://127.0.0.1:8001")
         p.add_argument("--reader-model", help="served model name (default: ask server)")
-        p.add_argument("--reader-max-tokens", type=int, default=16384)
+        p.add_argument("--reader-max-tokens", type=int,
+                       help="output token cap per page (default: the adapter's)")
+        p.add_argument("--reader-extra", help="JSON merged into every reader request")
         p.add_argument("--retries", type=int, default=1,
                        help="re-reads of a page whose output looped or was cut off")
 
     def editor_args(p):
         p.add_argument("--editor-url", default="http://127.0.0.1:8002")
         p.add_argument("--editor-model", help="served model name (default: ask server)")
+        p.add_argument("--editor-extra", help="JSON merged into every reviewer request, "
+                       "e.g. '{\"chat_template_kwargs\": {\"enable_thinking\": false}}'")
         p.add_argument("--review-types", default="formula",
                        help="block types always reviewed, comma-separated "
                             "(flagged blocks are reviewed regardless)")

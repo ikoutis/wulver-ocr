@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, Optional
@@ -40,13 +41,17 @@ class ChatClient:
     def __init__(self, base_url: str, model: Optional[str] = None,
                  api_key: str = "EMPTY", timeout: float = 600.0,
                  max_retries: int = 3,
-                 transport: Optional[httpx.BaseTransport] = None):
+                 transport: Optional[httpx.BaseTransport] = None,
+                 default_extra: Optional[dict] = None):
         self.base_url = base_url.rstrip("/")
         if not self.base_url.endswith("/v1"):
             self.base_url += "/v1"
         self._http = httpx.Client(timeout=timeout, transport=transport,
                                   headers={"Authorization": f"Bearer {api_key}"})
         self.max_retries = max_retries
+        # Merged into every request body, e.g. a reasoning model's switch
+        # {"chat_template_kwargs": {"enable_thinking": false}} (see profiles/).
+        self.default_extra = dict(default_extra or {})
         self.model = model or self._first_model()
 
     def _first_model(self) -> str:
@@ -63,7 +68,8 @@ class ChatClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": content})
         body = {"model": self.model, "messages": messages,
-                "max_tokens": max_tokens, "temperature": temperature}
+                "max_tokens": max_tokens, "temperature": temperature,
+                **self.default_extra}
         if extra:
             body.update(extra)
         delay = 2.0
@@ -73,7 +79,7 @@ class ChatClient:
                 if r.status_code < 500:
                     r.raise_for_status()
                     choice = r.json()["choices"][0]
-                    text = choice["message"].get("content") or ""
+                    text = strip_thinking(choice["message"].get("content") or "")
                     if choice.get("finish_reason") == "length":
                         # Truncated output is a validator signal, not an error:
                         # the caller sees it via the marker and flags the block.
@@ -90,6 +96,14 @@ class ChatClient:
 
 
 TRUNCATION_MARKER = "\n<<TRUNCATED>>"
+
+
+def strip_thinking(text: str) -> str:
+    """Drop <think>…</think> reasoning a model emits inline (when the server
+    runs without a reasoning parser). An unterminated <think> means the
+    budget ran out mid-thought: nothing after it is an answer."""
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S)
+    return text.split("<think>", 1)[0] if "<think>" in text else text
 
 
 def image_part(img: Image.Image) -> dict:

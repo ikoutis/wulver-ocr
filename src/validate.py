@@ -15,6 +15,8 @@ Flags:
   latex_env        \\begin/\\end mismatch
   latex_leftright  \\left/\\right count mismatch
   latex_delims     stray $ / \\( \\) / \\[ \\] inside a formula body
+  latex_katex      KaTeX cannot parse it (only when node + katex are
+                   available; see katex_check.py)
   inline_math      odd number of unescaped $ in a text block
   table_shape      rows with inconsistent effective column counts
   table_parse      table content is neither parseable HTML nor GFM
@@ -27,6 +29,7 @@ import zlib
 from html.parser import HTMLParser
 
 from .backend import TRUNCATION_MARKER
+from .katex_check import katex_error
 from .schema import Block
 
 # ----------------------------------------------------------------- repetition
@@ -89,8 +92,9 @@ def _envs_balanced(s: str) -> bool:
     return not stack
 
 
-def check_latex(body: str) -> list[str]:
-    """Structural checks on a display-formula body (no surrounding $$)."""
+def check_latex(body: str, display: bool = True) -> list[str]:
+    """Structural checks on a formula body (no surrounding delimiters), then,
+    if the structure is sound, a KaTeX parse."""
     flags = []
     if not _braces_balanced(body):
         flags.append("latex_braces")
@@ -101,6 +105,8 @@ def check_latex(body: str) -> list[str]:
     stripped = body.replace(r"\$", "")
     if "$" in stripped or re.search(r"\\[()\[\]]", stripped.replace(r"\\", "")):
         flags.append("latex_delims")
+    if not flags and body.strip() and katex_error(body, display) is not None:
+        flags.append("latex_katex")
     return flags
 
 
@@ -122,7 +128,7 @@ def check_inline_math(text: str) -> list[str]:
         return ["inline_math"]
     flags = []
     for m in _INLINE_MATH.finditer(text):
-        flags.extend(check_latex(m.group(1)))
+        flags.extend(check_latex(m.group(1), display=False))
     return sorted(set(flags))
 
 

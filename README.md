@@ -9,12 +9,13 @@ It pairs two models that are good at different things:
 
 | role | model class | job |
 |---|---|---|
-| **reader** (stage 1) | small document-OCR specialist (~1–3B) | reads every page in one pass: layout boxes, reading order, text, LaTeX, and HTML tables. It is fast and pixel-faithful. |
-| **reviewer** (stage 2) | large general VLM (~30B) | proofreads only what needs it, one image crop at a time: every display formula, every block a validator flagged, and every figure (to describe it). |
+| **reader** (stage 1) | document-OCR specialist: **Chandra OCR 2** (4B), or the MIT-licensed **dots.mocr** (3B) | reads every page in one pass: layout boxes, reading order, text, LaTeX, and HTML tables. It is fast and pixel-faithful. |
+| **reviewer** (stage 2) | general VLM: **Qwen3.8-27B** (fallback: Qwen3-VL-32B) | proofreads only what needs it, one image crop at a time: every display formula, every block a validator flagged, and every figure (to describe it). |
 
 The reviewer never rewrites a page. A proposed edit replaces the reader's text
 only if it passes a **gate**: it must add no validator flag the draft didn't
-already have, and it must change at most a bounded fraction of the draft.
+already have, and it must change at most a bounded fraction of the draft. The
+validators include a KaTeX parse of every formula.
 Every decision (agreed, edited, rejected, unreadable) is kept in the page
 JSON, so each output block can be traced to the model that wrote it.
 
@@ -30,15 +31,18 @@ JSON, so each output block can be traced to the model that wrote it.
 ```
 src/
   ├── ingest.py       PDF/images → page PNGs + manifest (content-addressed doc ids)
-  ├── readers/        stage-1 adapters, one per OCR model → common Block schema
+  ├── readers/        stage-1 adapters → common Block schema: chandra (HTML layout),
+  │                   dots (layout JSON), markdown (whole-page Markdown, any VLM)
   ├── validate.py     CPU checks: LaTeX structure, repetition loops, table shape, …
+  ├── katex_check.py  optional KaTeX parse of every formula (persistent node worker)
   ├── review.py       stage-2 gated proofreading (prompts, gate, provenance)
   ├── figures.py      figure crops + generated descriptions / structure
   ├── assemble.py     blocks → Markdown (running heads dropped, page-break joins)
   ├── backend.py      OpenAI-compatible HTTP client (talks to `vllm serve`)
   ├── schema.py       Page / Block data model (the JSON every stage reads/writes)
   └── run_ocr.py      CLI: ingest | read | review | assemble | all | status | todo
-profiles/             model pairs (repo ids, served names, vLLM flags)
+profiles/             model pairs: default (Chandra 2 + Qwen3.8-27B), dots (MIT reader),
+                      conservative (dots.mocr + Qwen3-VL-32B); repo ids, vLLM flags
 slurm/                ocr.sbatch (sharded array), serve_lib.sh, requeue_lib.sh
 tools/                setup_env.sh, stage_models.py, incomplete.py
 eval/                 degrade.py (scan simulation for the arXiv eval set)
@@ -58,8 +62,8 @@ pytest tests/
 Wulver (once; follows the dml repo's conventions):
 
 ```bash
-bash tools/setup_env.sh                          # conda env at /project/ikoutis/conda_env/wocr (+ vLLM)
-python tools/stage_models.py --profile default   # weights → /project/ikoutis/wocr_models
+bash tools/setup_env.sh                          # conda env at /project/ikoutis/conda_env/wocr (+ vLLM, KaTeX)
+python tools/stage_models.py --profile default   # ~65 GB of weights → /project/ikoutis/wocr_models
 ```
 
 ## Running
@@ -98,7 +102,8 @@ python -m src.run_ocr assemble --inputs papers/ --work work --out out
 python -m src.run_ocr status   --work work
 ```
 
-Useful knobs: `--review-types formula,table` (review all tables too),
+Pick the model pair with `WOCR_PROFILE=default|dots|conservative`. Other
+useful knobs: `--review-types formula,table` (review all tables too),
 `--no-flagged`, `--max-change 0.35`, `--no-describe-figures`, `--retries 1`
 (re-read a page whose output looped), and `PHASES="read assemble"` (run
 the reader only).

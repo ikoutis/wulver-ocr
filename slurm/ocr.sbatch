@@ -18,8 +18,12 @@
 #               per profile, so a rerun with another profile really re-reads)
 #   WOCR_PROFILE  model pair in profiles/<name>.sh: default (Chandra 2 +
 #               Qwen3.8-27B), dots (dots.mocr, MIT), conservative
-#   READ_ARGS   extra read flags, e.g. "--retry-failed"
+#   READ_ARGS   extra read flags, e.g. "--retry-failed" (re-read pages saved
+#               as failed placeholders; tools/incomplete.py --retry-failed
+#               lists their shards)
 #   REVIEW_ARGS extra review flags, e.g. "--review-types formula,table"
+#               (--force in either redoes that whole stage at every start of
+#               the task, a requeued start included)
 #   PHASES      subset of "read review assemble"     (default: all three)
 #   NSHARDS     shards in total (default: the array size; REQUIRED when you
 #               resubmit only some indices, e.g. via tools/incomplete.py)
@@ -33,7 +37,9 @@
 # same INPUTS, OUT and shard count (and WOCR_PROFILE / WORK, if you set them):
 #   IDS=$(python tools/incomplete.py --inputs $INPUTS --nshards 8 --out "$OUT")
 #   [ -n "$IDS" ] && INPUTS="$INPUTS" OUT="$OUT" NSHARDS=8 sbatch --array=$IDS slurm/ocr.sbatch
-# Interactive (inside `interactive -a ikoutis -q standard -j gpu`): run
+# Interactive, inside `interactive -a ikoutis -q standard -j gpu -n 16 -t 4`
+# (16 cores x 4 GB = this job's 64 GB; the defaults, 1 core with 4 GB and 1
+# hour, are too small for the model servers), run
 #   INPUTS=paper.pdf OUT=out WORK=work bash slurm/ocr.sbatch   # one shard, same phases
 #
 # Model servers listen on 127.0.0.1 at ports picked when they start, so
@@ -42,7 +48,9 @@
 # with the recovery line above. On the USR1 below (wall clock or preemption)
 # the task saves and requeues itself (slurm/requeue_lib.sh). The 30 min lead
 # covers the requests in flight (a long generation on the 27B reviewer takes
-# minutes), stopping the server, and the requeue: the dml convention.
+# minutes), stopping the server, and the requeue: the dml convention. So
+# --time must be well over 30 min (40 min or less is refused: the task would
+# be signalled at once and requeue itself forever).
 #
 # Throughput planning (to be measured, see dev-communication/design.md §5):
 # a 3–4B reader does roughly 1 page/s on an A100; the reviewer only sees
@@ -68,6 +76,10 @@
 #SBATCH --array=0-0
 
 set -euo pipefail
+# Until slurm/requeue_lib.sh is sourced below, a USR1 (an early preemption)
+# would kill this shell: record it instead, and the first step requeues.
+WOCR_SIGNALLED=0
+trap 'WOCR_SIGNALLED=1' USR1
 module load Miniforge3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 set +u
@@ -84,6 +96,15 @@ if [ -f "$(dirname "$0")/serve_lib.sh" ]; then
 else
     START="${SLURM_SUBMIT_DIR:-$PWD}"
     REPO=$START
+    # A batch job gets the USR1 30 min (the --signal lead above) before its
+    # time limit. A --time within 10 min of that lead leaves no time for
+    # work: the task would be signalled at once and requeue itself forever.
+    if [ -n "${SLURM_JOB_START_TIME:-}" ] && [ -n "${SLURM_JOB_END_TIME:-}" ] &&
+            [ $((SLURM_JOB_END_TIME - SLURM_JOB_START_TIME)) -le $((1800 + 600)) ]; then
+        echo "ERROR: --time must exceed the 30 min USR1 lead by more than 10 min" \
+             "(hours are sensible: each start loads a model)" >&2
+        exit 2
+    fi
 fi
 abspath() {                     # settings' relative paths are relative to START
     case "$1" in
@@ -130,10 +151,21 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader ||
 run_with_requeue python -m src.run_ocr ingest "${COMMON[@]}"
 
 has_phase() { [[ " $PHASES " == *" $1 "* ]]; }
+# The flags among a stage's extra args that change what it has left to do:
+# the todo gates count with them, or READ_ARGS="--retry-failed" would find
+# nothing to do and never start the reader.
+todo_flags() {
+    local w
+    for w in $1; do
+        case $w in --force | --retry-failed) echo "$w" ;; esac
+    done
+}
 
 # Each stage exits 85 on USR1 (requeue) and 3 if its model server fails
 # (set -e then fails the task); stop_server fails it too if the server died.
-if has_phase read && [ "$(python -m src.run_ocr todo --stage read "${COMMON[@]}" | tail -n1)" != 0 ]; then
+# shellcheck disable=SC2046  # todo_flags prints bare flags
+if has_phase read && [ "$(python -m src.run_ocr todo --stage read "${COMMON[@]}" \
+        $(todo_flags "${READ_ARGS:-}") | tail -n1)" != 0 ]; then
     start_server "$READER_NAME" "$WOCR_MODELS/$READER_NAME" "${READER_VLLM_ARGS[@]}"
     # shellcheck disable=SC2086  # READ_ARGS is a list of flags
     run_with_requeue python -m src.run_ocr read "${COMMON[@]}" \
@@ -143,7 +175,9 @@ if has_phase read && [ "$(python -m src.run_ocr todo --stage read "${COMMON[@]}"
     stop_server "$READER_NAME"
 fi
 
-if has_phase review && [ "$(python -m src.run_ocr todo --stage review "${COMMON[@]}" | tail -n1)" != 0 ]; then
+# shellcheck disable=SC2046  # todo_flags prints bare flags
+if has_phase review && [ "$(python -m src.run_ocr todo --stage review "${COMMON[@]}" \
+        $(todo_flags "${REVIEW_ARGS:-}") | tail -n1)" != 0 ]; then
     start_server "$EDITOR_NAME" "$WOCR_MODELS/$EDITOR_NAME" "${EDITOR_VLLM_ARGS[@]}"
     # shellcheck disable=SC2086  # REVIEW_ARGS is a list of flags
     run_with_requeue python -m src.run_ocr review "${COMMON[@]}" \

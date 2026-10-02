@@ -54,19 +54,29 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def make_doc_id(path: str, digest: str) -> str:
+def _stem(path: str) -> str:
     stem = os.path.splitext(os.path.basename(path))[0]
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")[:60] or "doc"
-    return f"{stem}-{digest[:16]}"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")[:60] or "doc"
+
+
+def make_doc_id(path: str, digest: str) -> str:
+    return f"{_stem(path)}-{digest[:16]}"
 
 
 def discover(inputs: list[str]) -> list[str]:
-    """Expand files / directories / @listfiles into a sorted list of documents.
+    """Expand files / directories / @listfiles into a list of documents.
 
     Directories are walked through symlinks (each real directory once), and
     hidden names are skipped there, macOS AppleDouble ``._x.pdf`` files
-    included. Explicitly named files are taken as given. A file reachable by
-    several paths is listed once, under the path that sorts first."""
+    included. Explicitly named files are taken as given.
+
+    Every document is listed once. A file reachable by several paths
+    (symlinks, ``./``, relative and absolute spellings) is listed under the
+    spelling whose absolute path sorts first, and byte-identical copies under
+    one name (one doc id) by the first copy, so no two shards share a doc id.
+    The list is ordered by real path, not by spelling: run_ocr (handed
+    absolute paths by slurm/ocr.sbatch) and tools/incomplete.py (handed the
+    user's INPUTS as typed) cut the same shards from it."""
     out: list[str] = []
     for item in inputs:
         if item.startswith("@"):
@@ -88,10 +98,36 @@ def discover(inputs: list[str]) -> list[str]:
                            and os.path.splitext(name)[1].lower() in PDF_EXT | IMAGE_EXT)
         else:
             out.append(item)
-    first: dict[str, str] = {}
-    for p in sorted(set(out)):
-        first.setdefault(os.path.realpath(p), p)
-    return sorted(first.values())
+    spelling: dict[str, str] = {}
+    for p in out:
+        real = os.path.realpath(p)
+        if real not in spelling or os.path.abspath(p) < os.path.abspath(spelling[real]):
+            spelling[real] = p
+    return _drop_copies([spelling[real] for real in sorted(spelling)])
+
+
+def _drop_copies(paths: list[str]) -> list[str]:
+    """``paths`` without the later of byte-identical files with one name (the
+    same doc id). Only files sharing a name and a size are hashed."""
+    groups: dict[tuple, list[str]] = {}
+    for p in paths:
+        try:
+            key: tuple = (_stem(p), os.path.getsize(p))
+        except OSError:                 # missing or unreadable: ingest reports it
+            key = (p,)
+        groups.setdefault(key, []).append(p)
+    copies = set()
+    for group in (g for g in groups.values() if len(g) > 1):
+        seen = set()
+        for p in group:
+            try:
+                doc_id = make_doc_id(p, sha256_file(p))
+            except OSError:
+                continue
+            if doc_id in seen:
+                copies.add(p)
+            seen.add(doc_id)
+    return [p for p in paths if p not in copies]
 
 
 def _cap(pixels: float) -> float:
@@ -224,13 +260,15 @@ def _load_manifest(path: str) -> dict | None:
         return json.load(f)
 
 
-def ingest(path: str, work_root: str, dpi: int = DEFAULT_DPI, force: bool = False) -> dict:
+def ingest(path: str, work_root: str, dpi: int = DEFAULT_DPI, force: bool = False,
+           digest: str | None = None) -> dict:
     """Render one document into its work directory; return its manifest.
 
     A document already ingested is returned as is. With ``force`` its pages
     are rendered again (e.g. at a new ``dpi``) and swapped in, and everything
-    derived from the old pages (read/, review/, figures/) is deleted."""
-    digest = sha256_file(path)
+    derived from the old pages (read/, review/, figures/) is deleted.
+    ``digest`` is the file's sha256, if the caller has it already."""
+    digest = digest or sha256_file(path)
     doc_id = make_doc_id(path, digest)
     doc_dir = os.path.join(work_root, doc_id)
     manifest_path = os.path.join(doc_dir, "manifest.json")

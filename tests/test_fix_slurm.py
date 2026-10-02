@@ -35,7 +35,10 @@ pytestmark = pytest.mark.skipif(not (shutil.which("bash") and shutil.which("curl
 
 # Like vLLM's launcher: bind first (SO_REUSEADDR, no SO_REUSEPORT), load the
 # model, then listen, so a second server on the port dies with EADDRINUSE at
-# bind or at listen; then uvicorn's start-up lines.
+# bind or at listen; then uvicorn's start-up lines. FAKE_UVICORN_ORDER=1 logs
+# "Application startup complete" before listen(), as real uvicorn does, and
+# FAKE_SHUTDOWN is how long a server that lost the port takes to exit (vLLM
+# shuts its engine down first). FAKE_READER_400=1: the reader rejects pages.
 FAKE_VLLM = r'''
 import http.server, json, os, socket, sys, threading, time
 
@@ -50,7 +53,14 @@ sock = socket.socket()
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind(("127.0.0.1", port))
 time.sleep(float(os.environ.get("FAKE_LOAD", "0.3")))      # "loading the model"
-sock.listen(64)
+if os.environ.get("FAKE_UVICORN_ORDER"):
+    print("INFO:     Application startup complete.", flush=True)
+try:
+    sock.listen(64)
+except OSError as e:
+    print(f"OSError: {e}", flush=True)
+    time.sleep(float(os.environ.get("FAKE_SHUTDOWN", "0")))
+    sys.exit(1)
 
 READER = ('<div data-bbox="100 100 900 200" data-label="Text"><p>Read by job JOB.</p></div>'
           '<div data-bbox="200 300 800 350" data-label="Equation-Block">'
@@ -80,6 +90,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         print(f"POST {self.path} max_tokens={req.get('max_tokens')}", flush=True)
         text = json.dumps(req["messages"])
+        if name.startswith("chandra") and os.environ.get("FAKE_READER_400"):
+            body = b'{"error": {"message": "maximum context length exceeded"}}'
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if name.startswith("chandra"):
             out = READER.replace("JOB", job)
         elif "KIND:" in text:
@@ -94,8 +111,9 @@ server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler,
                                          bind_and_activate=False)
 server.socket.close()
 server.socket = sock
-print(f"INFO:     Started server process [{os.getpid()}]", flush=True)
-print("INFO:     Application startup complete.", flush=True)
+if not os.environ.get("FAKE_UVICORN_ORDER"):
+    print(f"INFO:     Started server process [{os.getpid()}]", flush=True)
+    print("INFO:     Application startup complete.", flush=True)
 server.serve_forever()
 '''
 

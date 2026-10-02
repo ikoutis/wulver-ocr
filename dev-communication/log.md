@@ -11,6 +11,78 @@ the entry it answers.
 
 ---
 
+## 2026-10-02 — Note [O-005]: verifying the [O-004] fixes — 41 more findings fixed
+
+After [O-004], an independent pass checked its fixes against the merged code and reviewed the
+code afresh, again with a skeptic reproducing each finding in a scratch copy. It filed 41
+findings: 36 new ones and 5 earlier ones that were only partly fixed. Several are the same
+defect seen by more than one reviewer, so there were 29 distinct defects. All were fixed in
+three parallel branches with separate files (core and cluster scripts; reader adapters; gate
+and figures). On the core-and-scripts branch the suite went from 328 to 344 tests (338 run
+without node/KaTeX).
+
+**Recovery that did not recover.** These would have cost work on the cluster without saying so.
+
+- `READ_ARGS="--retry-failed"`, the documented way to re-read pages saved as failed
+  placeholders, did nothing in batch: the sbatch script skips a phase when `todo` reports
+  nothing left, and `todo` counted a placeholder as read. `todo` now counts as the stage will,
+  with the same `--retry-failed` and `--force`, and `tools/incomplete.py --retry-failed` lists
+  the shards that have failed pages.
+- With relative and absolute paths mixed in `INPUTS`, `tools/incomplete.py` named the wrong
+  shards, because the sbatch script hands the pipeline absolute paths and the document list was
+  sorted by spelling. It is now ordered by real path. Byte-identical copies of a file in two
+  folders are now one document, so two array tasks no longer work on the same one.
+- A full or over-quota `/scratch` during ingest marked documents `FAILED.json`, a terminal
+  state, and the task ended COMPLETED. A system error now marks nothing and exits 3.
+- Once `/scratch` purged a work directory, resubmitting its shard read, reviewed and rewrote
+  finished documents. `OUT` is now the completion record for the stages, as it already was for
+  `tools/incomplete.py`.
+
+**The cluster scripts.**
+
+- vLLM's current wheels are CUDA 13 builds, but the setup installed an unpinned vLLM with
+  torch's CUDA 12.9 build. vLLM is now pinned (0.30.0), the build follows the GPU driver
+  (CUDA 13 for a driver ≥ 580, the release's CUDA 12.9 wheel otherwise), and `--gpu-check`
+  loads vLLM's compiled kernels, so a mismatch shows there rather than in the first job.
+- uvicorn logs "Application startup complete" before it listens, so a server that lost a
+  same-port race could still be taken for ready. Readiness now requires our process to hold
+  the listening socket.
+- A `--time` of 30 minutes or less would be signalled at once and requeue forever; anything up
+  to 40 minutes is now refused. A USR1 while the job was still loading conda killed it; it now
+  requeues.
+- The interactive recipe now asks for 16 cores (64 GB) and 4 hours: `interactive`'s
+  defaults are 1 core, 4 GB and 1 hour.
+
+**Cut-off output on two-column pages was lost without a trace.** The region assumed lost was
+the strip below the lowest kept block. On a two-column page that missed the lost column, and a
+transcription of the strip cleared every record of the cut. The region now starts at the
+element the reader was writing when it was cut off, with the right column added when the cut
+fell in the left one. A transcribed region stays listed in `report.json`
+(`truncated_recovered`), and `correct` or an empty answer no longer counts as a transcription.
+
+**Smaller fixes to the readers and the gate.**
+
+- dots replies with single-backslash LaTeX lost `\frac`, `\theta` or `\nabla` to control
+  characters; they are repaired and flagged `json_repaired`.
+- A model's element-level loops came out as dozens of duplicate blocks; they are kept once and
+  flagged `repetition`.
+- Left-numbered equations got shifted `\tag`s. `<br>` ran lines together. The Markdown readers
+  demoted the title, and olmOCR's `\[…\]` and multi-line `\(…\)` math and its rotation
+  verdict were dropped.
+- At the gate:
+  - a reviewer edit that only dropped the readers' Markdown escapes passed;
+  - a no-op answer was misclassified;
+  - empty box-less blocks were sent as whole-page requests;
+  - blocks flagged `latex_unchecked` during a KaTeX outage were never checked again;
+  - an unclosed `$$` went unflagged.
+- For figures, a multi-panel graph, arrows set through TikZ styles, and a graph answer with no
+  usable TikZ each gave an incomplete or empty graph without a flag.
+
+None of this changes what [O-002] asks for. Its GPU-check step now prints which vLLM build the
+node's driver runs.
+
+---
+
 ## 2026-10-02 — Note [O-004]: adversarial code review before the first GPU run — 82 defects fixed
 
 Nothing in this repo has met a real model yet, so before [O-002] spends GPU hours, the whole
@@ -127,7 +199,7 @@ module load Miniforge3 && source "$(conda info --base)/etc/profile.d/conda.sh" \
     && conda activate /project/ikoutis/conda_env/wocr    # the env, in your own shell
 srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1 \
     --time=00:10:00 bash -l tools/setup_env.sh --gpu-check   # GPU check (free)
-# Paste its output. The driver's max CUDA version decides the vLLM wheel.
+# Paste its output. If it says the driver cannot run the env's build, reinstall as it says.
 python tools/stage_models.py --profile default           # ~65 GB to /project/ikoutis/wocr_models
 pytest tests/                                            # CPU, seconds
 
@@ -142,8 +214,9 @@ OUT=/project/ikoutis/$USER/wocr/runs/o002_smoke \
 **Report back:**
 
 1. The `nvidia-smi` line printed at the top of `logs/wocr_<job>_0.log`, plus torch, CUDA, and
-   vLLM versions (from `/project/ikoutis/conda_env/wocr/wocr.lock.txt`), and whether
-   `setup_env.sh`'s sanity line said `katex check: True`.
+   vLLM versions (from `/project/ikoutis/conda_env/wocr/wocr.lock.txt`), whether
+   `setup_env.sh`'s sanity line said `katex check: True`, and the GPU check's `driver …` and
+   `vllm ops: …` lines.
 2. Server start-up times (the `=== chandra_ocr_2 ready after …s on 127.0.0.1:<port> ===` line,
    and the same for `qwen3_8_27b`) and the `read:`/`review:` summary lines (pages saved,
    seconds, review decisions).

@@ -214,7 +214,8 @@ class TestDiscover:
         png(tmp_path / "store" / "2019" / "a.png", 50)
         os.symlink(tmp_path / "store" / "2019", papers / "2019")
         os.symlink(papers, papers / "2019" / "loop")    # a cycle
-        assert ing.discover([str(papers)]) == [str(papers / "2019" / "a.png"), b]
+        # (ordered by real path: store/2019/a.png after papers/b.png)
+        assert ing.discover([str(papers)]) == [b, str(papers / "2019" / "a.png")]
 
     def test_same_file_by_two_paths_listed_once(self, tmp_path):
         a = png(tmp_path / "papers" / "a.png")
@@ -273,18 +274,20 @@ class TestIncomplete:
                 open(os.path.join(out, doc, doc + ".md"), "w").close()
             capsys.readouterr()         # the pipeline's log
 
+        # Documents are ordered by real path, so the dangling moved.pdf (its
+        # target is gone.pdf) comes first: shard 0 holds it and broken.pdf.
         quoted = ["--inputs", " ".join(corpus), "--nshards", "2", "--out", out]
         assert incomplete_run(capsys, *quoted)[0] == "0-1"
-        assemble_shard(1)
+        assemble_shard(0)
         failed = [d for d in os.listdir(out) if os.path.exists(os.path.join(out, d, "FAILED.json"))]
         assert len(failed) == 1 and failed[0].startswith("broken-")
-        assert incomplete_run(capsys, *quoted)[0] == "0"
-        assemble_shard(0)
+        assert incomplete_run(capsys, *quoted)[0] == "1"
+        assemble_shard(1)
         ids, err = incomplete_run(capsys, *quoted)
         assert ids == "" and "moved.pdf" in err
         listing = incomplete_run(capsys, *quoted, "--list")[0].splitlines()
         assert [line.split(":")[1].strip() for line in listing] == [
-            "4/4 done (1 unreadable)", "4/4 done (1 failed)"]
+            "4/4 done (1 failed, 1 unreadable)", "4/4 done"]
 
     def test_empty_inputs_is_an_error(self, capsys):
         with pytest.raises(SystemExit) as e:

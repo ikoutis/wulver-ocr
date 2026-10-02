@@ -22,10 +22,12 @@
 # nvidia-smi sees one: >= 580 -> cu130 (PyPI), older -> cu129. Login nodes
 # have no driver: there the CUDA 13 build is installed, with a loud note,
 # and --gpu-check (below) says whether the GPU nodes' driver can run it.
-# Overrides: WOCR_TORCH_BACKEND=cu130 | cu129 | cu128 (the flavour),
-# WOCR_VLLM_WHEEL=<url or file> (the cu12x wheel, if its name differs). A
-# different flavour needs a fresh env (rm -rf the env first): uv keeps the
-# installed torch when only its CUDA build differs. If no wheel matches the
+# Overrides: WOCR_TORCH_BACKEND=cu130 | cu129 (the flavour; a release has
+# no other CUDA 12 wheel, e.g. +cu128 is a 404, and cu129 runs on 570-series
+# drivers too), WOCR_VLLM_WHEEL=<url or file> (the CUDA 12 wheel, if its
+# name differs; with it another cu12x flavour is accepted too). A different
+# flavour needs a fresh env (rm -rf the env first): uv keeps the installed
+# torch when only its CUDA build differs. If no wheel matches the
 # node driver, use the official container instead: `apptainer pull
 # docker://vllm/vllm-openai:<tag>` on a compute node (module load apptainer)
 # and run serve_lib.sh's command through `apptainer exec --nv`.
@@ -139,7 +141,13 @@ else
 fi
 case "$FLAVOUR" in
     cu130) ;;
-    cu12[0-9])
+    cu129 | cu12[0-8])
+        if [ "$FLAVOUR" != cu129 ] && [ -z "${WOCR_VLLM_WHEEL:-}" ]; then
+            echo "ERROR: WOCR_TORCH_BACKEND=$FLAVOUR: vLLM releases publish their CUDA 12" \
+                 "wheel as +cu129 only (it runs on drivers from R525 on): use cu129, or give" \
+                 "a $FLAVOUR wheel in WOCR_VLLM_WHEEL" >&2
+            exit 2
+        fi
         VLLM_VERSION="${VLLM_SPEC#vllm==}"
         if [ -z "${WOCR_VLLM_WHEEL:-}" ] && [ "$VLLM_VERSION" = "$VLLM_SPEC" ]; then
             echo "ERROR: the $FLAVOUR build needs an exact pin, WOCR_VLLM_SPEC=vllm==<version>" \
@@ -147,7 +155,7 @@ case "$FLAVOUR" in
             exit 2
         fi ;;
     *)
-        echo "ERROR: WOCR_TORCH_BACKEND=$FLAVOUR: expected cu130, cu129 or cu128" >&2
+        echo "ERROR: WOCR_TORCH_BACKEND=$FLAVOUR: expected cu130 or cu129" >&2
         exit 2 ;;
 esac
 if [ -f "$ENV_PREFIX/wocr.flavour" ] && [ "$(cat "$ENV_PREFIX/wocr.flavour")" != "$FLAVOUR" ]; then

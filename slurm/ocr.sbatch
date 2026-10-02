@@ -1,4 +1,4 @@
-#!/bin/bash -l
+#!/bin/bash
 # =============================================================================
 # ocr.sbatch — scanned papers -> Markdown, one array task per shard.
 #
@@ -13,9 +13,11 @@
 #
 # Configure by environment variables (sbatch exports your shell by default):
 #   INPUTS      REQUIRED. dir(s), PDF/image file(s), or @listfile, space-separated
-#   OUT         Markdown output root   (default /project/ikoutis/$USER/wocr/out)
+#   OUT         Markdown output root   (default /project/ikoutis/$USER/wocr/out).
+#               It is the completion record: a document with its .md there is
+#               not redone, so a rerun with another profile needs its own OUT
 #   WORK        page images + JSON     (default /scratch/ikoutis/$USER/wocr/work/<profile>:
-#               per profile, so a rerun with another profile really re-reads)
+#               per profile, so two profiles never share a reading)
 #   WOCR_PROFILE  model pair in profiles/<name>.sh: default (Chandra 2 +
 #               Qwen3.8-27B), dots (dots.mocr, MIT), conservative
 #   READ_ARGS   extra read flags, e.g. "--retry-failed" (re-read pages saved
@@ -23,12 +25,17 @@
 #               lists their shards)
 #   REVIEW_ARGS extra review flags, e.g. "--review-types formula,table"
 #               (--force in either redoes that whole stage at every start of
-#               the task, a requeued start included)
+#               the task, a requeued start included; a finished document
+#               whose WORK was purged is redone only by READ_ARGS=--force)
 #   PHASES      subset of "read review assemble"     (default: all three)
 #   NSHARDS     shards in total (default: the array size; REQUIRED when you
 #               resubmit only some indices, e.g. via tools/incomplete.py)
+#   WOCR_LOGIN_PROFILE  what a batch task loads as its login environment
+#               (Lmod's `module`, a conda init hook in ~/.bashrc): 1 (default)
+#               /etc/profile and the first of ~/.bash_profile, ~/.bash_login,
+#               ~/.profile, as `bash -l` does; 0 nothing; or a file to load
 # Relative paths are taken relative to the directory you submit (or run) from
-# (paths inside an @listfile: make them absolute).
+# (paths inside an @listfile, files or folders: make them absolute).
 #
 # Submit from the repo root, e.g. 8 shards:
 #   export INPUTS=/project/ikoutis/$USER/papers OUT=/project/ikoutis/$USER/wocr/runs/o00N_<what>
@@ -80,6 +87,24 @@ set -euo pipefail
 # would kill this shell: record it instead, and the first step requeues.
 WOCR_SIGNALLED=0
 trap 'WOCR_SIGNALLED=1' USR1
+# The login environment, which `#!/bin/bash -l` used to load before the
+# first line of this script, when a USR1 still killed it (a conda init hook
+# takes seconds). A batch task only: sbatch runs a spool copy of this file,
+# and `bash slurm/ocr.sbatch` keeps the environment of your shell.
+# shellcheck disable=SC1090,SC1091  # the profiles are the user's and the site's
+if [ ! -f "$(dirname "$0")/serve_lib.sh" ] && [ "${WOCR_LOGIN_PROFILE:-1}" != 0 ]; then
+    set +euo pipefail               # profiles are not written for -eu
+    if [ "${WOCR_LOGIN_PROFILE:-1}" = 1 ]; then
+        [ -r /etc/profile ] && . /etc/profile
+        for _wocr_f in ~/.bash_profile ~/.bash_login ~/.profile; do
+            if [ -r "$_wocr_f" ]; then . "$_wocr_f"; break; fi
+        done
+    else
+        . "$WOCR_LOGIN_PROFILE"
+    fi
+    set -euo pipefail
+    trap 'WOCR_SIGNALLED=1' USR1    # in case a profile set a trap of its own
+fi
 module load Miniforge3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 set +u

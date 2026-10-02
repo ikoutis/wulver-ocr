@@ -66,9 +66,11 @@ def make_doc_id(path: str, digest: str) -> str:
 def discover(inputs: list[str]) -> list[str]:
     """Expand files / directories / @listfiles into a list of documents.
 
-    Directories are walked through symlinks (each real directory once), and
-    hidden names are skipped there, macOS AppleDouble ``._x.pdf`` files
-    included. Explicitly named files are taken as given.
+    Directories, named on the command line or on a line of an @listfile
+    (``ls -d papers/*`` lists subfolders too), are walked through symlinks
+    (each real directory once), and hidden names are skipped there, macOS
+    AppleDouble ``._x.pdf`` files included. Explicitly named files are taken
+    as given.
 
     Every document is listed once. A file reachable by several paths
     (symlinks, ``./``, relative and absolute spellings) is listed under the
@@ -78,26 +80,32 @@ def discover(inputs: list[str]) -> list[str]:
     absolute paths by slurm/ocr.sbatch) and tools/incomplete.py (handed the
     user's INPUTS as typed) cut the same shards from it."""
     out: list[str] = []
+
+    def add(item: str) -> None:
+        if not os.path.isdir(item):
+            out.append(item)
+            return
+        seen = {os.path.realpath(item)}
+        for root, dirs, files in os.walk(item, followlinks=True):
+            kept = []
+            for d in sorted(dirs):
+                real = os.path.realpath(os.path.join(root, d))
+                if not d.startswith(".") and real not in seen:   # no cycles
+                    seen.add(real)
+                    kept.append(d)
+            dirs[:] = kept
+            out.extend(os.path.join(root, name) for name in files
+                       if not name.startswith(".")
+                       and os.path.splitext(name)[1].lower() in PDF_EXT | IMAGE_EXT)
+
     for item in inputs:
         if item.startswith("@"):
             with open(item[1:], encoding="utf-8") as f:
-                out.extend(line.strip() for line in f
-                           if line.strip() and not line.startswith("#"))
-        elif os.path.isdir(item):
-            seen = {os.path.realpath(item)}
-            for root, dirs, files in os.walk(item, followlinks=True):
-                kept = []
-                for d in sorted(dirs):
-                    real = os.path.realpath(os.path.join(root, d))
-                    if not d.startswith(".") and real not in seen:   # no cycles
-                        seen.add(real)
-                        kept.append(d)
-                dirs[:] = kept
-                out.extend(os.path.join(root, name) for name in files
-                           if not name.startswith(".")
-                           and os.path.splitext(name)[1].lower() in PDF_EXT | IMAGE_EXT)
+                for line in f:
+                    if line.strip() and not line.startswith("#"):
+                        add(line.strip())
         else:
-            out.append(item)
+            add(item)
     spelling: dict[str, str] = {}
     for p in out:
         real = os.path.realpath(p)
@@ -253,6 +261,14 @@ def _render_image(path: str, pages_dir: str) -> list[float]:
     return scales
 
 
+def missing_pages(doc_dir: str, manifest: dict) -> list[str]:
+    """The page images a manifest lists that are not on disk (/scratch purges
+    file by file, so a work dir can lose its pages and keep its manifest)."""
+    pages = manifest.get("pages") or [os.path.join("pages", f"p{i + 1:04d}.png")
+                                      for i in range(manifest.get("n_pages") or 0)]
+    return [p for p in pages if not os.path.exists(os.path.join(doc_dir, p))]
+
+
 def _load_manifest(path: str) -> dict | None:
     if not os.path.exists(path):
         return None
@@ -264,7 +280,9 @@ def ingest(path: str, work_root: str, dpi: int = DEFAULT_DPI, force: bool = Fals
            digest: str | None = None) -> dict:
     """Render one document into its work directory; return its manifest.
 
-    A document already ingested is returned as is. With ``force`` its pages
+    A document already ingested is returned as is, once any page image it
+    lost (a partial purge of /scratch) is rendered again, as it was: the same
+    file at the manifest's dpi gives the same page. With ``force`` its pages
     are rendered again (e.g. at a new ``dpi``) and swapped in, and everything
     derived from the old pages (read/, review/, figures/) is deleted.
     ``digest`` is the file's sha256, if the caller has it already."""
@@ -281,6 +299,13 @@ def ingest(path: str, work_root: str, dpi: int = DEFAULT_DPI, force: bool = Fals
             print(f"WARNING {doc_id}: pages were rendered at {old.get('dpi')} dpi; "
                   f"--dpi {dpi} takes effect only with `ingest --force`",
                   file=sys.stderr, flush=True)
+        if missing_pages(doc_dir, old):
+            pages_dir = os.path.join(doc_dir, "pages")
+            os.makedirs(pages_dir, exist_ok=True)
+            if ext in PDF_EXT:          # both skip the pages still on disk
+                _render_pdf(path, pages_dir, old.get("dpi") or dpi)
+            elif ext in IMAGE_EXT:
+                _render_image(path, pages_dir)
         return old
     if ext not in PDF_EXT | IMAGE_EXT:
         raise ValueError(f"unsupported input type: {path}")

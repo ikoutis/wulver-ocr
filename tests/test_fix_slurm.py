@@ -154,7 +154,8 @@ class Fakes:
                if not k.startswith("SLURM_") and k not in drop}
         env.update(PATH=f"{self.bin}:{os.environ['PATH']}", USER="tester",
                    WOCR_MODELS=str(self.models), WOCR_SERVER_LOGDIR=str(self.vlogs),
-                   WOCR_SERVER_POLL="0.2", FAKE_SCONTROL_LOG=str(self.scontrol_log))
+                   WOCR_SERVER_POLL="0.2", FAKE_SCONTROL_LOG=str(self.scontrol_log),
+                   WOCR_LOGIN_PROFILE="0")     # never this machine's real login profile
         env.update({k: str(v) for k, v in kw.items()})
         return env
 

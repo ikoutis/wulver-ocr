@@ -16,11 +16,12 @@ whose order does not depend on how a path is spelled (the sbatch script
 hands run_ocr absolute paths).
 
 A document is finished when <OUT>/<doc_id>/<doc_id>.md exists (OUT is the
-completion record: run_ocr does not redo it when its WORK has been purged),
-or when <OUT>/<doc_id>/FAILED.json says the file itself could not be
-ingested (terminal: running it again does not help). An input that cannot
-be read at all (missing, unreadable) is skipped with a warning, as the
-pipeline skips it. Doc ids are computed from file contents (sha256), so this
+completion record: run_ocr does not redo it when its WORK has been purged,
+even partly), or when <OUT>/<doc_id>/FAILED.json says the file itself could
+not be ingested (terminal: running it again does not help). An input that
+cannot be read at all (missing, unreadable) is skipped with a warning, as
+the pipeline skips it; a folder named in an @listfile is walked, as one
+named in INPUTS is. Doc ids are computed from file contents (sha256), so this
 works before ingestion too. OUT defaults to $OUT, then to the sbatch
 script's default.
 

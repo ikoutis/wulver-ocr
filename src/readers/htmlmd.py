@@ -319,6 +319,9 @@ def _ol_label(k: int, kind: str) -> str:
     return label.upper() if kind in "AI" else label
 
 
+_OWN_NUMBER = re.compile(r"(\d{1,9})\\?[.)](?:[ \t]+|$)")
+
+
 def _list(node: Node, depth: int = 0, br: str = HARD_BREAK) -> str:
     """An ordered list is numbered from its start (or an item's value).
     Markdown has no lettered lists: the items of one get a bullet and their
@@ -339,6 +342,13 @@ def _list(node: Node, depth: int = 0, br: str = HARD_BREAK) -> str:
                 label = _ol_label(k, kind)
                 if not re.match(rf"\(?{re.escape(label)}[.)]", text, re.I):
                     text = f"({label}) {text}"
+            elif kind is not None:
+                # The reader often leaves the item's own number in its text
+                # ("<li>1. n is odd"); escaped by now ("1\\."). It is the
+                # document's numbering: it becomes the marker, not a twin.
+                own = _OWN_NUMBER.match(text)
+                if own:
+                    k, text = int(own.group(1)), text[own.end():]
             marker = f"{k}." if kind is not None and kind not in _LETTERED else "-"
             lines.append("  " * depth + f"{marker} " + text)
             lines.extend(nested)

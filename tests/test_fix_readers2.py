@@ -346,6 +346,12 @@ class TestOrderedLists:
          "- (a) connected;\n- b) regular."),
         ('<ol type="1"><li>one</li></ol>', "1. one"),
         ("<ul><li>x</li></ul>", "- x"),
+        # The item's own number ([O-002]: "1. 1\\. Ana scored 90" from a quiz)
+        ("<ol><li>1. one</li><li>2. two</li></ol>", "1. one\n2. two"),
+        ("<ol><li>1) one</li></ol>", "1. one"),
+        ("<ol><li>3. three</li><li>four</li></ol>", "3. three\n4. four"),
+        ("<ol><li>1.5 is a number</li></ol>", "1. 1.5 is a number"),
+        ("<ul><li>1. x</li></ul>", "- 1\\. x"),
     ])
     def test_markers(self, html, out):
         assert md(html) == out

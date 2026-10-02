@@ -13,9 +13,12 @@ Flags:
                    content, or the block is the empty tail a reader adds for
                    the part of the page its cut-off output lost
                    (meta["truncated_tail"])
-  repetition       degenerate loop (the classic VLM-OCR failure mode), or the
-                   reader kept one copy of an element its model wrote
-                   several times (meta["repeated"] = n >= 2)
+  repetition       degenerate loop in the content itself (the classic
+                   VLM-OCR failure mode)
+  repeated         the reader kept one copy of an element its model wrote
+                   several times (meta["repeated"] = n >= 2). The kept copy
+                   is an ordinary reading, so unlike "repetition" this does
+                   not make the draft degenerate (review.DEGENERATE)
   json_repaired    the reader had to repair invalid escapes in this
                    element's JSON (meta["json_repaired"]), so its LaTeX may
                    have been decoded wrongly
@@ -294,7 +297,7 @@ def validate_block(b: Block) -> list[str]:
         if b.meta.get("json_repaired"):
             flags.append("json_repaired")
         if (b.meta.get("repeated") or 0) >= 2:
-            flags.append("repetition")
+            flags.append("repeated")
     c = c.replace(TRUNCATION_MARKER, "")
     if b.type == "figure":
         return sorted(set(flags))

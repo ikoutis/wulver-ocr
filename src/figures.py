@@ -12,23 +12,29 @@ asked to classify each figure and, by kind, to emit:
                       meta["graph"], and the Markdown version is rendered
                       from them, so the two cannot disagree. A picture that
                       does not parse (or draws edges to undeclared vertices)
-                      is sent back to the reviewer once with the problems
+                      is sent back to the reviewer once with the problems.
+                      If it still fails, the figure is flagged (tikz_*), the
+                      Markdown version says it is unavailable, and the
+                      partial parse is kept as meta["graph_partial"].
   diagram             Mermaid (renders natively on GitHub / Obsidian)
   commutative_diagram tikz-cd
   plot                series, axes, and legible key values
 The crop is always kept and linked; the description is an addition, never a
-replacement, and is marked as generated in the Markdown.
+replacement, and is marked as generated in the Markdown. An answer cut off
+at the length limit is flagged "description_truncated" and its structure is
+left out (a graph's TikZ is sent back once first, like a failed check).
 """
 
 from __future__ import annotations
 
 import os
 import re
+from typing import Sequence
 
 from PIL import Image
 
-from .backend import (ChatClient, ServerError, Stopped, check_stop, image_part,
-                      map_concurrent, text_part)
+from .backend import (TRUNCATION_MARKER, ChatClient, ServerError, Stopped, check_stop,
+                      image_part, map_concurrent, text_part)
 from .review import crop
 from .schema import Block, Page, page_stem
 from .tikz import check_tikzcd, graph_markdown, normalise, parse_graph
@@ -37,6 +43,9 @@ FIGURE_KINDS = ("plot", "graph", "diagram", "commutative_diagram",
                 "table_image", "algorithm", "photo", "other")
 _FENCE = {"graph": "latex", "diagram": "mermaid",
           "commutative_diagram": "latex", "plot": "text"}
+_TIKZ_KINDS = ("graph", "commutative_diagram")    # checked; sent back on failure
+_CUT_OFF = ("the answer was cut off at the length limit: write the TikZ compactly, "
+            "one line per vertex and edge")
 
 # Built with str.replace, not str.format: the TikZ example is full of braces.
 DESCRIBE_PROMPT = r"""This image is a figure from a research paper.
@@ -95,42 +104,66 @@ def caption_for(blocks: list[Block], i: int) -> str:
 
 
 def parse_description(reply: str) -> dict:
-    m = re.search(r"KIND:\s*([a-z_]+)", reply, re.I)
-    kind = m.group(1).lower() if m else "other"
-    kind = kind if kind in FIGURE_KINDS else "other"
+    """-> {kind, summary, structure} (+ truncated=True for a reply cut off at
+    the length limit; the marker itself is removed). Tolerates Markdown
+    around the label and value: **KIND:** graph, KIND: `commutative diagram`."""
+    truncated = TRUNCATION_MARKER.strip() in reply
+    reply = reply.replace(TRUNCATION_MARKER.strip(), "")
+    m = re.search(r"\bKIND\W*:\W*([a-z_ ]+)", reply, re.I)
+    kind = re.sub(r"\s+", "_", m.group(1).strip().lower()) if m else "other"
+    kind = next((k for k in FIGURE_KINDS                 # "graph drawing" -> graph
+                 if kind == k or kind.startswith(k + "_")), "other")
     d = re.search(r"<description>\s*(.*?)\s*(?:</description>|<structure>|$)", reply, re.S)
     s = re.search(r"<structure>\s*(.*?)\s*(?:</structure>|$)", reply, re.S)
     structure = s.group(1).strip() if s else ""
     structure = re.sub(r"^```[a-z-]*\n|\n?```$", "", structure).strip()
-    return {"kind": kind, "summary": d.group(1).strip() if d else "",
+    info = {"kind": kind, "summary": d.group(1).strip() if d else "",
             "structure": structure}
+    if truncated:
+        info["truncated"] = True
+    return info
 
 
 def check_structure(info: dict) -> tuple[dict, list[str], list[str]]:
     """Normalise and check a graph / commutative-diagram transcription.
-    -> (info with normalised structure (+ parsed graph), flags, problems)."""
+    -> (info with normalised structure (+ parsed graph), flags, problems).
+    A cut-off answer fails the check for every kind (description_truncated)."""
+    flags, problems = (["description_truncated"], [_CUT_OFF]) if info.get("truncated") \
+        else ([], [])
     if not info.get("structure"):
-        return info, [], []
+        return info, flags, problems
     if info["kind"] == "graph":
         info = dict(info, structure=normalise(info["structure"]))
-        graph, flags, problems = parse_graph(info["structure"])
+        graph, more, why = parse_graph(info["structure"])
         if graph is not None:
             info["graph"] = graph
-        return info, flags, problems
+        return info, sorted(set(flags + more)), problems + why
     if info["kind"] == "commutative_diagram":
         info = dict(info, structure=normalise(info["structure"], "tikzcd"))
-        flags, problems = check_tikzcd(info["structure"])
-        return info, flags, problems
-    return info, [], []
+        more, why = check_tikzcd(info["structure"])
+        return info, sorted(set(flags + more)), problems + why
+    return info, flags, problems
 
 
-def format_description(info: dict) -> str:
+def format_description(info: dict, problems: Sequence[str] = ()) -> str:
+    """The Markdown description. ``problems`` are what the final check found
+    (check_structure): with any, a graph's Markdown version says it is
+    unavailable instead of rendering a partial parse that would contradict
+    the TikZ shown below it. A cut-off answer's structure is left out."""
     out = f"**Kind:** {info['kind']}. {info['summary']}".strip()
+    if info.get("truncated"):
+        return out + ("\n\n*(cut off at the length limit: the description may be "
+                      "incomplete, and any structure is left out)*")
     if info["kind"] == "graph" and info.get("structure"):
         # Two marked versions of the same graph: simple Markdown (derived from
         # the parsed TikZ, so they cannot disagree) and the TikZ itself.
-        md = graph_markdown(info["graph"]) if info.get("graph") and info["graph"]["nodes"] \
-            else "*(not available: the TikZ below did not parse)*"
+        graph = info.get("graph")
+        if graph and graph["nodes"] and not problems:
+            md = graph_markdown(graph)
+        else:
+            why = "; ".join("`{}`".format(" ".join(p.replace("`", "'").split()))
+                            for p in problems) or "it did not parse"
+            md = f"*(not available: the TikZ below failed the checks: {why})*"
         out += (f"\n\n**Graph — Markdown (simple):** {md}"
                 f"\n\n**Graph — TikZ:**\n\n```latex\n{info['structure']}\n```")
     elif info.get("structure"):
@@ -164,8 +197,10 @@ def describe_figure(client: ChatClient, page: Page, k: int, model_tag: str,
                     repair: int = 1) -> Block:
     """Describe figure block ``k`` of ``page`` (meta['description'], ['kind'],
     and ['graph'] for graph drawings). A graph or commutative diagram whose
-    TikZ fails the checks is sent back ``repair`` times with the problems;
-    the last answer is kept either way, and remaining problems become flags.
+    TikZ fails the checks (or whose answer was cut off) is sent back
+    ``repair`` times with the problems. The last answer is kept either way;
+    remaining problems become flags, and a graph that still fails gets no
+    Markdown version and keeps its partial parse as meta['graph_partial'].
 
     Same failure contract as review.review_block: Stopped and ServerError
     propagate (the page is not saved); any other error is recorded on the
@@ -194,16 +229,17 @@ def _describe(client, page, k, b, model_tag, repair):
         info = parse_description(client.chat([image_part(fig), text_part(prompt)],
                                              max_tokens=4096))
         info, flags, problems = check_structure(info)
-        if not flags or attempt == repair:
+        if not flags or info["kind"] not in _TIKZ_KINDS or attempt == repair:
             break
         prompt = base + REPAIR_SUFFIX.replace("<<PROBLEMS>>", "\n".join(
             f"- {x}" for x in problems)).replace("<<PREVIOUS>>", info["structure"])
     b.meta["kind"] = info["kind"]
-    b.meta["description"] = format_description(info)
+    b.meta["description"] = format_description(info, problems)
     b.meta["description_source"] = model_tag
     b.meta["describe_attempts"] = attempt + 1
     if "graph" in info:
-        b.meta["graph"] = info["graph"]
+        # Only a graph that passed every check is data to score (design §7).
+        b.meta["graph_partial" if problems else "graph"] = info["graph"]
     b.flags = sorted(set(b.flags) | set(flags))
 
 

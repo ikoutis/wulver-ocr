@@ -83,6 +83,7 @@ from .assemble import assemble  # noqa: E402
 from .backend import ChatClient, ServerError, map_concurrent  # noqa: E402
 from .figures import crop_figures, describe_figure, needs_description  # noqa: E402
 from .readers import READERS, get_reader  # noqa: E402
+from .readers.base import reading_loss  # noqa: E402
 from .review import ReviewPolicy, review_block  # noqa: E402
 from .schema import Block, Page, atomic_write_text, page_stem  # noqa: E402
 from .validate import validate_block  # noqa: E402
@@ -220,9 +221,15 @@ def _finished_and_purged(args, doc_id: str) -> bool:
         return False
     doc_dir = os.path.join(args.work, doc_id)
     try:
-        return bool(ing.missing_pages(doc_dir, load_manifest(doc_dir)))
+        man = load_manifest(doc_dir)
+        lost = ing.missing_pages(doc_dir, man)
     except (OSError, ValueError):       # no (readable) manifest: purged
         return True
+    # Lost page images with every reading kept: ingest renders them again and
+    # the document is assembled again from its JSON (e.g. by a newer assembler).
+    return bool(lost) and not all(
+        os.path.exists(os.path.join(doc_dir, "read", page_stem(k) + ".json"))
+        for k in range(man["n_pages"]))
 
 
 def _made_under(out_dir: str) -> str | None:
@@ -290,31 +297,13 @@ def stage_ingest(args):
     log(f"ingested {len(docs)} document(s) under {args.work}")
 
 
-def _area(bbox) -> float:
-    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
-
-
-def _attempt_loss(blocks: list[Block]) -> tuple:
-    """How much of the page a reading lost, to choose between attempts:
-    first a cut (counted once, however many tail regions it left) plus each
-    element that loops in its text ("repetition") or that the reader kept
-    once of several copies ("repeated"); then the area of the regions the
-    cut lost, a region without a box counting as the whole page. (0, 0) is
-    a clean reading, which needs no retry."""
-    cut = [b for b in blocks if "truncated" in b.flags]
-    loops = sum(1 for b in blocks if {"repetition", "repeated"} & set(b.flags))
-    lost = sum(_area(b.bbox) if b.bbox and b.meta.get("truncated_tail") else 1.0
-               for b in cut)
-    return (bool(cut) + loops, round(lost, 6))
-
-
 def _read_one(reader, doc_dir: str, idx: int, retries: int) -> Page:
     """Read one page. Stopped/ServerError propagate (nothing is saved), and
     so does a FileNotFoundError for a page image that is gone (the page stays
     in todo; the next run's ingest renders it again); deterministic failures
     end in a saved placeholder page (see module doc). A reading that was cut
     off, looped, or repeated an element is retried; the attempt that lost
-    least is kept (_attempt_loss), the first of equals."""
+    least is kept (readers.base.reading_loss), the first of equals."""
     check_stop()
     img_path = os.path.join(doc_dir, "pages", page_stem(idx) + ".png")
     errors: list[str] = []
@@ -338,10 +327,10 @@ def _read_one(reader, doc_dir: str, idx: int, retries: int) -> Page:
             continue
         for b in blocks:
             b.flags = validate_block(b)
-        loss = _attempt_loss(blocks)
+        loss = reading_loss(blocks)
         if best is None or loss < best[0]:
             best = (loss, blocks, attempt)
-        if loss == (0, 0):
+        if loss[:2] == (0, 0):          # nothing lost, nothing repeated
             break
     if best is None:
         return _save_failed_page(reader, doc_dir, idx, img_path, img.size, errors)

@@ -24,6 +24,7 @@ from PIL import Image
 from conftest import FakeServer
 from src import ingest as ing
 from src import run_ocr
+from src.readers.base import reading_loss
 from src.schema import Block
 from src.validate import validate_block
 from test_fix_ops2 import run_setup
@@ -501,12 +502,14 @@ def test_the_attempt_that_lost_least_is_kept(doc_dir):
 
 
 def test_attempt_loss_is_zero_only_for_a_clean_reading():
+    # run_ocr scores attempts with readers.base.reading_loss:
+    # (area lost, repeated elements, -kept text); (0, 0, ...) needs no retry
     def loss(*blocks):
         bs = [Block(**kw) for kw in blocks]
         for b in bs:
             b.flags = validate_block(b)
-        return run_ocr._attempt_loss(bs)
+        return reading_loss(bs)
 
-    assert loss(text("Fine.", [0, 0, 1, 1])) == (0, 0)
-    assert loss(text("Fine."), tail([0, 0.5, 1, 1]), tail([0.5, 0.2, 1, 0.5])) == (1, 0.65)
-    assert loss(text("Fine.", repeated=2))[0] == 1
+    assert loss(text("Fine.", [0, 0, 1, 1]))[:2] == (0, 0)
+    assert loss(text("Fine."), tail([0, 0.5, 1, 1]), tail([0.5, 0.2, 1, 0.5]))[:2] == (0.65, 0)
+    assert loss(text("Fine.", repeated=2))[:2] == (0, 1)

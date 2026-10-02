@@ -18,8 +18,20 @@ skeptic reproducing each finding in a scratch copy. It filed 21 findings: 19 new
 earlier ones that were only partly fixed. Two of them are the same defect. Three were rated
 medium, the rest low: these are edge cases, but several would have cost GPU time or a finished
 document without saying so. All were fixed in three parallel branches with separate files
-(core and cluster scripts; reader adapters; gate and figures), then merged. The merged suite
-went from 473 to TBD tests (TBD run without node/KaTeX; the other TBD need it).
+(core and cluster scripts; reader adapters; gate and figures). This time, each branch was also
+re-checked adversarially before it was merged. Those re-checks found seven small regressions in
+the new code, and the integration commit fixed them:
+
+- a column edge chosen by an overhanging box;
+- a below-columns region added for a deep bottom margin;
+- plain-operator display math (`(1+x)(1-x)`) no longer lifted;
+- notes about "the page" accepted as transcriptions, and real sentences mentioning "only"
+  rejected;
+- escaped tags in table cells;
+- a paragraph's own indentation counted as a change;
+- finished documents with only their page images purged counted as purged.
+
+The merged suite went from 473 to 591 tests (584 run without node/KaTeX; the other 7 need it).
 
 **Recovery that could still go wrong.**
 
@@ -61,14 +73,16 @@ went from 473 to TBD tests (TBD run without node/KaTeX; the other TBD need it).
 and the attempt with fewer flagged blocks was kept. Since [O-005] a left-column cut leaves two
 tail regions, and Chandra flagged every block of a repeated element, so the count could favour
 the attempt that lost more: one cut in the title over one cut low in the left column, or a
-cut-off retry over a complete page with one repeated element. A cut now counts once and each
-repeated element once; then the area lost decides.
+cut-off retry over a complete page with one repeated element. Attempts are now compared by the
+page area they lost, then by repeated elements, then by the text they kept
+(`readers.base.reading_loss`).
 
 **A repeated element is no longer a degenerate draft.** The kept copy of an element the model
 wrote several times was flagged `repetition`, which the gate treats as degenerate: no change
 limit and no escape check, so the reviewer could rewrite correct text freely. It now gets its
-own flag, `repeated`, and is reviewed under the flagged limit, like `json_repaired`. The page
-is still re-read once. A loop inside one block's own text is still `repetition`.
+own flag, `repeated`, and keeps the clean-block change limit (0.35), since the kept copy is an
+ordinary reading. The page is still re-read once. A loop inside one block's own text is still
+`repetition`.
 
 **The readers.**
 
@@ -78,7 +92,9 @@ is still re-read once. A loop inside one block's own text is still `repetition`.
   boxes that look like a column.
 - A tail region fitted between kept columns ran to the page bottom, so a full-width float
   below the columns was cut in half. It now ends where the columns end, with a full-width
-  region below them.
+  region below them. After a cut in the *left* column, the regions still run to the page
+  bottom: nothing read tells where the columns end. That limitation is documented in
+  `design.md` §3.
 - olmOCR: a LaTeX row break with spacing (`\\[4pt]`) was taken for the start of display math,
   which mangled the formula and swallowed the following paragraphs. An escaped bracket around
   a citation key (`\[ABC+20\]`) could also become a formula block; only a body that looks

@@ -67,3 +67,23 @@ def test_gate_keeps_reader_hard_line_breaks():
     draft = f"Department of Mathematics{HARD_BREAK}NJIT, Newark"
     assert dropped_escapes(draft, "Department of Mathematics\nNJIT, Newark") == [HARD_BREAK]
     assert dropped_escapes(draft, draft) == []
+
+
+def test_read_attempts_scored_by_reading_loss(tmp_path):
+    # one scoring for read retries (readers.base.reading_loss): a reading
+    # whose only defect is a collapsed element loop still earns one re-read
+    from src.readers.base import reading_loss
+    rep = Block(type="text", content="Same paragraph.", bbox=[0, 0, 1, 0.2], meta={"repeated": 3})
+    from src.validate import validate_block
+    rep.flags = validate_block(rep)
+    assert "repeated" in rep.flags and "repetition" not in rep.flags
+    assert reading_loss([rep])[:2] == (0, 1)        # not clean: worth a retry
+
+
+def test_repeated_block_gets_the_clean_change_limit():
+    from src.review import gate
+    b = Block(type="formula", content=r"\|x_{t+1}\| \le \rho \|x_t\|", meta={"repeated": 4})
+    from src.validate import validate_block
+    b.flags = validate_block(b)
+    ok, why = gate(b, r"\int_0^1 f(t)\,dt", ReviewPolicy())
+    assert not ok and "limit 0.35" in why

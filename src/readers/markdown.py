@@ -201,7 +201,7 @@ _DISPLAY_BRACKETS = re.compile(r"(?<!\\)\\\[((?:(?!(?<!\\)\\\[).)*?)\\\]", re.S)
 # What only math holds: a command, a script, a relation, a group. A
 # Markdown-escaped citation (\[1, 2\], \[Spi04\], \[ABC+20\], \[3, §2\],
 # \[Spi04, Thm. 2(b)\]) or interval (\[−1, 1\]) holds none of these.
-_MATHY = re.compile(r"\\[A-Za-z]|[\^_=<>{}|]")
+_MATHY = re.compile(r"\\[A-Za-z]|[\^_=<>{}|]|\s[-+*/\u2212]\s|\)\s*\(")
 _TABLE = re.compile(r"(<table\b.*?</table>)", re.S | re.I)
 _TURN = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
          270: Image.Transpose.ROTATE_270}

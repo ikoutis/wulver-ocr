@@ -88,12 +88,19 @@ _PLACEHOLDER = re.compile(
     r"nothing(?:" + _NOTE_END + r"|\s+(?:else|more|further|to\s+transcribe|visible|legible"
     r"|readable|shown|here|in|on|but|except|apart|besides)\b)"
     r"|no\s+(?:other\s+|more\s+|further\s+|additional\s+|legible\s+|visible\s+"
-    r"|readable\s+)?(?:text|content|transcription)\b"
+    r"|readable\s+)?(?:text|content|transcription)\b(?!-)"
     r"|(?:blank|empty|illegible|unreadable)(?:\s+(?:region|crop|image|area|page|space"
-    r"|line))?" + _NOTE_END +
-    r"|only\s+(?:a\s+|the\s+|one\s+)?(?:page\s+numbers?|footer|running\s+head)"
-    r"|(?:the\s+|this\s+)?(?:region|crop|image|area)\b[^()\[\]\n]*?\b(?:blank|empty"
-    r"|illegible|unreadable|nothing|only|page\s+numbers?)\b"
+    r"|line|text|content|handwriting))?" + _NOTE_END +
+    r"|(?:text|content|handwriting)\s+(?:is\s+)?(?:illegible|unreadable)" + _NOTE_END +
+    r"|there\s+is\s+nothing(?:" + _NOTE_END + r"|\s+(?:else|more|here|visible|legible"
+    r"|to\s+transcribe|in\s+(?:the|this)\s+(?:image|region|crop|area|page))\b)"
+    r"|(?:only|just)\s+(?:a\s+|the\s+|one\s+)?(?:page\s+numbers?|footer|running\s+head)"
+    r"|[^()\[\]\n]*?\bintentionally\s+(?:left\s+)?blank\b"
+    r"|(?:the\s+|this\s+)?(?:(?:rest|remainder|part|bottom)\s+of\s+(?:the\s+|this\s+)?)?"
+    r"(?:visible\s+|remaining\s+)?(?:region|crop|image|area|page|rest|remainder)\b"
+    r"[^()\[\]\n]*?\b(?:blank|empty|illegible|unreadable|nothing|page\s+numbers?"
+    r"|only\s+(?:a\s+|the\s+|one\s+)?(?:page\s+numbers?|whitespace|white\s+space"
+    r"|footer|running\s+head))\b"
     r"|[^()\[\]\n]*?\btranscri(?:be|bed|bing|ption)\b"
     r")[^()\[\]\n]*"
     r"|(?:a\s+|the\s+)?page\s+numbers?(?:\s*:?\s*['\"]?[0-9ivxlc]+['\"]?)?(?:\s+only)?"
@@ -306,11 +313,15 @@ def same_text(a: str, b: str, kind: str) -> bool:
             s = _TEXT_GROUP.sub(lambda m: m.group(1) + "{" + m.group(2).replace(" ", "\0")
                                 + "}", " ".join(s.split()))
             return re.sub(r"(?<![A-Za-z\\]) |(?<!\\) (?![A-Za-z])", "", s)
-        lines, starts_block = [], True
+        lines, starts_block, in_list = [], True, False
         for ln in s.strip().splitlines():
             text = " ".join(ln.split())
             indent = ln[:len(ln) - len(ln.lstrip())]
-            keep = text and (starts_block or _LIST_ITEM.match(ln))
+            item = _LIST_ITEM.match(ln)
+            in_list = in_list or bool(item)
+            # a paragraph's own indentation (up to 3 columns) does not render;
+            # after a list item it decides whether the paragraph is in the item
+            keep = text and (item or starts_block and (in_list or len(indent.expandtabs(4)) >= 4))
             lines.append((indent if keep else "") + text)
             starts_block = not text
         return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
@@ -322,6 +333,8 @@ def same_text(a: str, b: str, kind: str) -> bool:
 # keeping from opening a tag. A table's are taken out before counting.
 _TABLE_TAG = re.compile(r"</?(?:table|thead|tbody|tfoot|tr|td|th|caption|colgroup|col|br|sup"
                         r"|sub|b|i|strong|em)\b[^<>]*>", re.I)
+_ESC_TABLE_TAG = re.compile(r"&lt;/?(?:table|thead|tbody|tfoot|tr|td|th|caption|colgroup"
+                            r"|col|br|sup|sub|b|i|strong|em)\b", re.I)
 
 
 def dropped_escapes(draft: str, proposal: str, kind: str = "text") -> list[str]:
@@ -330,6 +343,10 @@ def dropped_escapes(draft: str, proposal: str, kind: str = "text") -> list[str]:
     outside its tags: a restored <td> is not a dropped '&lt;')."""
     d, p = outside_math(draft), outside_math(proposal)
     if kind == "table":
+        # a cell's escaped tag (&lt;b&gt;) turned into a tag is still a drop
+        if (len(_ESC_TABLE_TAG.findall(p)) < len(_ESC_TABLE_TAG.findall(d))
+                and len(_TABLE_TAG.findall(p)) > len(_TABLE_TAG.findall(d))):
+            return ["&lt;"]
         d, p = _TABLE_TAG.sub("\0", d), _TABLE_TAG.sub("\0", p)
     return [esc for esc, bare in _ESCAPES.items()
             if p.count(esc) < d.count(esc)
@@ -368,7 +385,8 @@ def gate(block: Block, proposal: str, policy: ReviewPolicy) -> tuple[bool, str]:
         if lost:
             return False, f"drops Markdown escapes {lost}"
     # latex_unchecked says nothing against the draft: it keeps the tight bound
-    limit = (policy.max_change_flagged if old_flags - {"latex_unchecked"}
+    # and so does "repeated": the kept copy is an ordinary reading
+    limit = (policy.max_change_flagged if old_flags - {"latex_unchecked", "repeated"}
              else policy.max_change)
     frac = change_fraction(draft, proposal)
     if frac > limit:

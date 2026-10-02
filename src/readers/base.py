@@ -44,7 +44,7 @@ COLUMN = 0.55               # a box ending before this is in the left half (a
                             # left column); one starting after 1 - COLUMN, the right
 COLUMN_TEXT = 0.1           # how tall the boxes justified to one right edge in the
                             # left half must be together to be a column of text
-BELOW_ROOM = 0.05           # page below a band of columns, past a bottom margin as
+BELOW_ROOM = 0.1            # page below a band of columns, past a bottom margin as
                             # deep as the top one, that can hold more content
 _EPS = 0.01
 
@@ -111,9 +111,13 @@ def truncated_tail(kept: list[Block], source: str, cut=None) -> list[Block]:
                    and b[3] <= anchor[1] + _EPS), default=0.0)
         band = [b for b in boxes if b[1] >= top - _EPS]
         left = [b for b in band if b[2] <= COLUMN]
+        # the right edge most of the band's text is justified to (a box that
+        # overhangs it, an overfull line or a wide float, is no other column)
+        column = max(([b for b in left if abs(b[2] - e) <= _EPS]
+                      for e in {b[2] for b in left if b[2] >= 1 - COLUMN}),
+                     key=lambda c: sum(b[3] - b[1] for b in c), default=[])
         edge = max((b[2] for b in left), default=0.0)
-        column = [b for b in left if b[2] >= edge - _EPS]
-        if (edge >= 1 - COLUMN and len(column) >= 2
+        if (len(column) >= 2
                 and sum(b[3] - b[1] for b in column) >= COLUMN_TEXT
                 and not any(b[0] >= 1 - COLUMN for b in band)):
             regions = [[x0, y, edge, 1.0], [edge, min(b[1] for b in left), 1.0, 1.0]]

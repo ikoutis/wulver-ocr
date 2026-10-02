@@ -87,7 +87,8 @@ class TestRepeatedIsNotDegenerate:
     def test_change_limit_applies(self):
         b = block("formula", r"\|x_{t+1} - x^\star\| \le \rho \, \|x_t - x^\star\|", repeated=4)
         ok, why = gate(b, r"\int_0^1 f(t)\,dt = \sum_{k \ge 0} c_k", ReviewPolicy())
-        assert not ok and why.startswith("change") and "limit 0.60" in why
+        # the kept copy is an ordinary reading: the clean-block limit applies
+        assert not ok and why.startswith("change") and "limit 0.35" in why
         ok, why = gate(b, r"\|x_{t+1} - x^\star\| \le \rho \, \|x_{t} - x^\star\|",
                        ReviewPolicy())
         assert ok and "degenerate" not in why

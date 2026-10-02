@@ -59,9 +59,9 @@ The design gives each model the job it is good at and contains each one's failur
    and the one GitHub and Obsidian display it with. Two flags come from what a reader adapter
    saw while parsing: `repeated` on an element the model wrote several times (kept once), and
    `json_repaired` on a dots element whose single-backslash LaTeX had to be repaired before its
-   JSON could be read. Neither marks a degenerate draft: the kept copy of a repeated element
-   is an ordinary reading, so it is reviewed under the flagged limit below. A loop inside one
-   block's own text is `repetition`, which is degenerate.
+   JSON could be read. Neither marks a degenerate draft. The kept copy of a repeated element
+   is an ordinary reading, so it keeps the clean-block limit below. A repaired element gets the
+   flagged limit. A loop inside one block's own text is `repetition`, which is degenerate.
 3. The **reviewer** (generalist) sees only what needs it. That means every display formula (the
    project's emphasis, so all of them are reviewed by default), every flagged block, and every
    figure. Each request carries **one image crop plus the reader's draft**. The reviewer answers
@@ -227,9 +227,17 @@ column gets a second region. The page counts as two-column only when the left bo
 a column (they share one right edge near the middle); a one-column page cut in a short
 left-aligned element (a list item, a heading) keeps one full-width region. A region fitted
 between kept columns ends where they end, with a full-width region below them when there is
-room (a float at the bottom of the page). The page is re-read once, and the attempt that lost
-least is kept: a cut counts once, however many regions it left, and so does each looping or
-repeated element; then the area lost decides. If it is still cut off, the
+room (a float at the bottom of the page). After a left-column cut both regions still run to
+the page bottom, because nothing read tells where the columns end; a full-width float below
+them then lands in the right-column crop. The page is re-read once, and the attempt that lost
+least is kept (`readers.base.reading_loss`). The attempts are compared on:
+
+1. the page area lost (empty tail regions, plus blocks whose text loops), so a cut weighs what
+   it lost rather than how many regions stand for it;
+2. then the number of repeated elements;
+3. then the amount of text kept.
+
+If it is still cut off, the
 reviewer transcribes each region from its crop. A tail it transcribed is recorded
 (`tail_recovered`) and `report.json` lists its page under `truncated_recovered`, so a
 transcription of the wrong region can never make the cut disappear. A tail still empty is

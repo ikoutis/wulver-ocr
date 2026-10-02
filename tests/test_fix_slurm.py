@@ -39,6 +39,8 @@ pytestmark = pytest.mark.skipif(not (shutil.which("bash") and shutil.which("curl
 # "Application startup complete" before listen(), as real uvicorn does, and
 # FAKE_SHUTDOWN is how long a server that lost the port takes to exit (vLLM
 # shuts its engine down first). FAKE_READER_400=1: the reader rejects pages.
+# FAKE_CRASH=1: the engine process fails during start-up as vLLM's does, its
+# root cause logged well before the API server's long traceback ends the log.
 FAKE_VLLM = r'''
 import http.server, json, os, socket, sys, threading, time
 
@@ -46,12 +48,32 @@ argv = sys.argv
 port = int(argv[argv.index("--port") + 1])
 name = argv[argv.index("--served-model-name") + 1]
 job = os.environ.get("SLURM_JOB_ID", "local")
+print(f"ENV VLLM_USE_FLASHINFER_SAMPLER={os.environ.get('VLLM_USE_FLASHINFER_SAMPLER', 'unset')}",
+      flush=True)
 timer = threading.Timer(float(os.environ.get("FAKE_LIFETIME", "120")), os._exit, (0,))
 timer.daemon = True                     # never outlive a failed test for long
 timer.start()
 sock = socket.socket()
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind(("127.0.0.1", port))
+if os.environ.get("FAKE_CRASH"):
+    tag = "(EngineCore pid=1) ERROR 10-02 16:31:13 [core.py:1366] "
+    print(tag + "EngineCore failed to start.")
+    print(tag + "Traceback (most recent call last):")
+    for i in range(20):
+        print(tag + f'  File "/env/vllm/v1/m{i}.py", line {i}, in f{i}')
+        print(tag + "    result = fn(self, *args, **kwargs)")
+        print(tag + "             ^^^^^^^^^^^^^^^^^^^^^^^^^")
+    print(tag + "RuntimeError: Error building extension 'sampling_...': ninja: build stopped")
+    print(tag + "FAILED: sampling.cuda.o: nvcc fatal : No such file or directory")
+    print("(APIServer pid=0) Traceback (most recent call last):")
+    for i in range(30):
+        print(f'(APIServer pid=0)   File "/env/vllm/entrypoints/a{i}.py", line {i}, in g{i}')
+        print("(APIServer pid=0)     return await anext(self.gen)")
+    print("(APIServer pid=0)     raise RuntimeError(")
+    print("(APIServer pid=0) RuntimeError: Engine core initialization failed. "
+          "See root cause above. Failed core proc(s): {}", flush=True)
+    sys.exit(1)
 time.sleep(float(os.environ.get("FAKE_LOAD", "0.3")))      # "loading the model"
 if os.environ.get("FAKE_UVICORN_ORDER"):
     print("INFO:     Application startup complete.", flush=True)
@@ -273,6 +295,9 @@ def test_two_array_tasks_on_one_node_each_use_their_own_servers(fakes, tmp_path)
     reader_a = (fakes.vlogs / "vllm_chandra_ocr_2_1001.log").read_text()
     reader_b = (fakes.vlogs / "vllm_chandra_ocr_2_1002.log").read_text()
     assert "max_tokens=777" in reader_a and "max_tokens=777" not in reader_b
+    # No FlashInfer sampler: its kernels are compiled with nvcc on first use,
+    # which the GPU nodes cannot do ([O-002]); vLLM's own needs no toolkit.
+    assert "ENV VLLM_USE_FLASHINFER_SAMPLER=0" in reader_a
 
 
 def test_interactive_run_uses_the_repo_and_the_callers_relative_paths(fakes, tmp_path):
@@ -441,6 +466,31 @@ echo NOT REACHED
     assert "SERVE ERROR: chandra_ocr_2 had exited on its own" in text
     assert "Application startup complete" in text            # the log tail
     assert "NOT REACHED" not in text
+
+
+def test_a_server_that_fails_at_start_reports_the_root_cause(fakes, tmp_path):
+    """vLLM's engine process logs why it failed ("EngineCore failed to
+    start" + traceback + message) and the API server then dies with its own
+    long traceback, so the log's last 40 lines never reached the cause
+    ([O-002]: the FlashInfer build error was 180 lines up). The report
+    shows the message lines of this start, then the tail."""
+    script = r'''
+set -euo pipefail
+source slurm/serve_lib.sh
+start_server chandra_ocr_2 "$WOCR_MODELS/chandra_ocr_2"
+echo NOT REACHED
+'''
+    p = fakes.bash(script, fakes.env(SLURM_JOB_ID=7002, FAKE_CRASH=1), tmp_path / "run.out")
+    assert finish(p) == 1
+    text = (tmp_path / "run.out").read_text()
+    assert "SERVE ERROR: chandra_ocr_2 exited during startup" in text
+    assert "NOT REACHED" not in text
+    errors, tail = text.split("--- error lines of", 1)[1].split("--- last lines of", 1)
+    assert "EngineCore failed to start." in errors
+    assert "ninja: build stopped" in errors and "nvcc fatal" in errors    # the cause
+    assert "Engine core initialization failed" in errors
+    assert 'File "' not in errors and "^^^" not in errors                # frames: no
+    assert "Engine core initialization failed" in tail
 
 
 # ---------------------------------------------------------- requeue_lib.sh

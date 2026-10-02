@@ -100,6 +100,14 @@ in the first job. If the driver is too old, it prints the reinstall command
 (a fresh env with `WOCR_TORCH_BACKEND=cu129`). A release has no other CUDA 12
 build, so `cu129` is also the one for a 570-series driver.
 
+Two settings in `slurm/ocr.sbatch` came from the first runs on Wulver and
+are needed there: the env's own `lib` goes first on `LD_LIBRARY_PATH`
+(the `vllm` command otherwise loads the nodes' older `libstdc++` and dies
+on `CXXABI_1.3.15`), and `VLLM_USE_FLASHINFER_SAMPLER=0` (FlashInfer
+compiles its sampling kernels with `nvcc` on first use, which fails on the
+nodes; vLLM's own sampler needs no compiler). A server that fails to start
+puts its log's error lines, not just its tail, in the job's `.err`.
+
 ## Running
 
 Batch, sharded across array tasks. Each task takes 1/N of the documents and

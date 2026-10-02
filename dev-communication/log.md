@@ -37,8 +37,18 @@ them in the pipeline itself:
    `ocr.sbatch` puts the env's `lib` first on `LD_LIBRARY_PATH` after activation (this
    alone fixed it, confirmed on a `debug_gpu` job); and `--gpu-check` now runs the `vllm`
    command itself.
+4. **A compiler at run time.** With the C++ runtime fixed, `vllm serve` loaded Chandra OCR 2
+   (a Qwen3.5 architecture: `Qwen3_5ForConditionalGeneration`, 4B), profiled 55 GB of KV cache,
+   captured its CUDA graphs and warmed its Triton kernels in 5 minutes, then died in the
+   sampler warm-up: vLLM 0.30's sampler calls FlashInfer, which compiles its top-k/top-p
+   kernels with `nvcc` on first use (`gen_sampling_module().build_and_load()`), and that build
+   fails on the GPU nodes. `ocr.sbatch` now sets `VLLM_USE_FLASHINFER_SAMPLER=0`: vLLM's own
+   Triton sampler, which needs no toolkit (and the reader samples greedily anyway). Finding
+   this took three round trips because `serve_lib.sh` reported only the last 40 lines of the
+   server log, all of them the API server's traceback; the engine's root cause was 180 lines
+   up. The report now shows the log's error lines first, then the tail.
 
-The smoke run is resubmitted with the fix. Its inputs are the two public samples now in
+The smoke run is resubmitted with the fixes. Its inputs are the two public samples now in
 `samples/` (a born-digital IEEE paper with numbered equations; a 19th-century book scan) and a
 handwritten quiz with graph drawings that stays on `/project`. Results follow in the next
 entry.

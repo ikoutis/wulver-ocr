@@ -48,6 +48,22 @@ _wocr_log_has() {
     grep -q -- "$3" < <(tail -c +"$2" "$1")
 }
 
+# A failed start's log, for the job's .err: its error lines first, then the
+# tail. vLLM's engine process logs the root cause ("EngineCore failed to
+# start" and its traceback) long before the API server's own traceback ends
+# the log, so the last 40 lines alone miss it (seen in [O-002]: the FlashInfer
+# build error was 180 lines up). The traceback's frames and code lines are
+# indented after vLLM's "[core.py:N]" tag; the unindented lines are the
+# messages.
+_wocr_log_errors() {
+    local log=$1 from=$2
+    echo "--- error lines of $log (this start):" >&2
+    tail -c +"$from" "$log" | grep -nE "ERROR|Error|error|Exception|FAILED|fatal|Killed|No space left" |
+        grep -vE '\]  |^[0-9]+:\s*File "|\^\^\^|\) (INFO|WARNING|DEBUG) ' | tail -n 30 >&2 || true
+    echo "--- last lines of $log:" >&2
+    tail -n 15 "$log" >&2
+}
+
 # True if process $1, or a descendant of it, holds the socket that listens on
 # 127.0.0.1:$2 (its inode, from /proc/net/tcp, among the processes' fds).
 _wocr_owns_port() {
@@ -105,8 +121,8 @@ start_server() {
                     echo "=== port $port was taken before $name bound it; trying another ==="
                     continue 2
                 fi
-                echo "SERVE ERROR: $name exited during startup; last lines of $log:" >&2
-                tail -n 40 "$log" >&2
+                echo "SERVE ERROR: $name exited during startup" >&2
+                _wocr_log_errors "$log" "$from"
                 return 1
             fi
             if _wocr_log_has "$log" "$from" "Application startup complete" &&
@@ -124,8 +140,8 @@ start_server() {
             sleep "$WOCR_SERVER_POLL"
         done
     done
-    echo "SERVE ERROR: $name lost the race for a free port $attempt times; last lines of $log:" >&2
-    tail -n 40 "$log" >&2
+    echo "SERVE ERROR: $name lost the race for a free port $attempt times" >&2
+    _wocr_log_errors "$log" "$from"
     return 1
 }
 

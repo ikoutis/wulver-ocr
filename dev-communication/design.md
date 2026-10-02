@@ -449,6 +449,11 @@ the driver is too old for the env, the check prints the reinstall command (a fre
 `WOCR_TORCH_BACKEND=cu129`). If no wheel fits the driver, there are two fallbacks: pin an
 older vLLM (`WOCR_VLLM_SPEC`) or run the official container under Apptainer
 (`module load apptainer`; `apptainer pull docker://vllm/vllm-openai:<tag>` on a compute node).
+Nothing is compiled at run time: the job turns vLLM's FlashInfer sampler off
+(`VLLM_USE_FLASHINFER_SAMPLER=0`, since FlashInfer builds those kernels with `nvcc` on first
+use and the nodes cannot), and vLLM's Triton kernels compile with Triton's own bundled
+compiler. The env's `lib` goes first on `LD_LIBRARY_PATH` for the `vllm` command's C++ runtime
+(both from [O-002]).
 
 **Throughput (to be measured in [O-002]).** The rough expectation for one A100:
 

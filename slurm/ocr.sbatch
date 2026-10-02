@@ -176,6 +176,12 @@ source slurm/serve_lib.sh
 source slurm/requeue_lib.sh
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1   # weights are pre-staged
 export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+# vLLM's own (Triton) sampler, not FlashInfer's: FlashInfer compiles its
+# top-k/top-p kernels with nvcc on first use, under $HOME/.cache/flashinfer,
+# and that build failed on the GPU nodes, so every server start died in the
+# sampler warm-up ("EngineCore failed to start", [O-002]). The Triton kernels
+# need no toolkit. Sampling quality is the same; the reader is greedy anyway.
+export VLLM_USE_FLASHINFER_SAMPLER=0
 
 COMMON=(--inputs "${IN[@]}" --work "$WORK" --out "$OUT" --shard "$SHARD")
 

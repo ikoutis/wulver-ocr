@@ -131,6 +131,10 @@ EOF
         echo "    note in tools/setup_env.sh (libstdcxx-ng) and ocr.sbatch (LD_LIBRARY_PATH)"
     fi
     rm -f "$CLI_ERR"
+    # FlashInfer builds some of its kernels with nvcc on first use. ocr.sbatch
+    # keeps vLLM off the one such path a job hits (the sampler), so none is
+    # needed; this line is for reading a job log that says otherwise.
+    echo "nvcc: $(command -v nvcc || echo "none on PATH (fine: ocr.sbatch uses vLLM's own sampler)")"
     exit 0
 fi
 

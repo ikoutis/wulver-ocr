@@ -28,7 +28,7 @@
 #   source slurm/requeue_lib.sh
 #   run_with_requeue python -m src.run_ocr read ...
 
-WOCR_SIGNALLED=0
+WOCR_SIGNALLED=${WOCR_SIGNALLED:-0}   # keep a USR1 recorded before sourcing (ocr.sbatch)
 _wocr_flag_usr1() {
     WOCR_SIGNALLED=1
     echo "=== USR1 between steps: will requeue before the next step | $(date) ==="

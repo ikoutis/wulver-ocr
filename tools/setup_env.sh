@@ -13,25 +13,32 @@
 # a recent enough driver on the GPU nodes. `pip freeze` is saved next to the
 # env as wocr.lock.txt.
 #
-# CUDA flavour. vLLM's default wheels are built for CUDA 12.9 (12.8 and 13.0
-# builds also exist). Login nodes have no driver to auto-detect, so the
-# flavour is explicit: WOCR_TORCH_BACKEND=cu129 (default) | cu128 | cu130.
-# CUDA 13 needs a driver >= 580; check `nvidia-smi` on a GPU node (the srun
-# line below) before choosing it. To pin vLLM: WOCR_VLLM_SPEC="vllm==<ver>".
-# If the wheels and the node driver cannot be reconciled, use the official
-# container instead: `apptainer pull docker://vllm/vllm-openai:<tag>` on a
-# compute node (module load apptainer) and run serve_lib.sh's command
-# through `apptainer exec --nv`.
+# vLLM version and CUDA flavour. vLLM is pinned to a tested release,
+# WOCR_VLLM_SPEC (default vllm==0.30.0). Its PyPI wheel, and the torch 2.13
+# it pins, are CUDA 13 builds, which need a GPU driver >= 580. For older
+# drivers each release also has a +cu129 wheel on GitHub, installed with
+# torch from the PyTorch cu129 index (vLLM's own install docs); CUDA 12
+# builds run on drivers from R525 on. The flavour follows the driver when
+# nvidia-smi sees one: >= 580 -> cu130 (PyPI), older -> cu129. Login nodes
+# have no driver: there the CUDA 13 build is installed, with a loud note,
+# and --gpu-check (below) says whether the GPU nodes' driver can run it.
+# Overrides: WOCR_TORCH_BACKEND=cu130 | cu129 | cu128 (the flavour),
+# WOCR_VLLM_WHEEL=<url or file> (the cu12x wheel, if its name differs). A
+# different flavour needs a fresh env (rm -rf the env first): uv keeps the
+# installed torch when only its CUDA build differs. If no wheel matches the
+# node driver, use the official container instead: `apptainer pull
+# docker://vllm/vllm-openai:<tag>` on a compute node (module load apptainer)
+# and run serve_lib.sh's command through `apptainer exec --nv`.
 #
 # Login nodes have no GPU (cuda=False below is expected) and cap memory at
 # 20 GB per user; if the vLLM install is killed there, run this script inside
-# an interactive CPU session instead. Then verify on a GPU (debug QOS, free);
-# --gpu-check only runs nvidia-smi and the torch/vLLM check in the env:
+# an interactive CPU session instead. Then verify on a GPU (debug QOS, free):
 #     srun --account=ikoutis --qos=debug --partition=debug_gpu \
 #          --gres=gpu:a100_10g:1 --time=00:10:00 bash -l tools/setup_env.sh --gpu-check
-# If torch reports cuda=False on the GPU node, the wheel's CUDA is newer than
-# the node driver (nvidia-smi prints the max CUDA it supports): reinstall with
-# a matching wheel, e.g. WOCR_VLLM_SPEC="vllm==<older>" or the cu12x variant.
+# --gpu-check runs nvidia-smi, says which flavour the node's driver needs,
+# checks that torch sees the GPU, and loads vLLM's compiled ops (vLLM loads
+# them lazily, so a wheel built for another CUDA would otherwise fail only
+# inside the first job). If it reports a mismatch, reinstall as it says.
 #
 # The script activates the env only for itself. In your own shell, before
 # tools/stage_models.py, pytest, or anything else that needs the env, run:
@@ -41,9 +48,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."             # requirements.txt, src/ and logs/ are in the repo root
 
 ENV_PREFIX="${WOCR_CONDA_ENV:-/project/ikoutis/conda_env/wocr}"
-VLLM_SPEC="${WOCR_VLLM_SPEC:-vllm}"
-TORCH_BACKEND="${WOCR_TORCH_BACKEND:-cu129}"
+VLLM_SPEC="${WOCR_VLLM_SPEC:-vllm==0.30.0}"
 ACTIVATE="module load Miniforge3 && source \"\$(conda info --base)/etc/profile.d/conda.sh\" && conda activate $ENV_PREFIX"
+
+# The GPU driver's version (e.g. 550.54.15), or nothing when none is visible.
+driver_version() {
+    local v
+    v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1) || true
+    [[ "$v" =~ ^[0-9]+\. ]] && echo "$v"
+    return 0
+}
+
+# The vLLM build a driver runs: CUDA 13 needs >= 580.
+flavour_for() {
+    if [ "${1%%.*}" -ge 580 ]; then echo cu130; else echo cu129; fi
+}
 
 module load Miniforge3
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -53,13 +72,88 @@ if [ "${1:-}" = --gpu-check ]; then
     conda activate "$ENV_PREFIX"
     set -u
     nvidia-smi || echo "[!] nvidia-smi failed: no GPU or no driver on this node"
+    DRIVER=$(driver_version)
+    INSTALLED=$(cat "$ENV_PREFIX/wocr.flavour" 2>/dev/null || echo unknown)
+    if [ -n "$DRIVER" ]; then
+        echo "driver $DRIVER runs the $(flavour_for "$DRIVER") build; this env has: $INSTALLED"
+        if [ "$INSTALLED" = cu130 ] && [ "$(flavour_for "$DRIVER")" != cu130 ]; then
+            echo "[!] this driver cannot run the env's CUDA 13 build. Reinstall:"
+            echo "    rm -rf $ENV_PREFIX && WOCR_TORCH_BACKEND=cu129 bash tools/setup_env.sh"
+        fi
+    fi
     python - <<'EOF'
-import torch, vllm
+import importlib
+import importlib.util
+
+import torch
+import vllm
+
 ok = torch.cuda.is_available()      # first: get_device_name() raises when CUDA is unusable
 print(f"torch {torch.__version__} (CUDA {torch.version.cuda}) | vllm {vllm.__version__} "
       f"| cuda={ok}" + (f" | {torch.cuda.get_device_name(0)}" if ok else ""))
+
+
+def present(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+# vLLM loads its compiled ops lazily; load them now, so that a wheel built
+# for another CUDA than torch's or the driver's fails here.
+ops = [m for m in ("vllm._C", "vllm._C_stable_libtorch", "vllm._moe_C",
+                   "vllm._moe_C_stable_libtorch") if present(m)]
+failed = []
+for m in ops:
+    try:
+        importlib.import_module(m)
+    except Exception as e:          # e.g. libcudart.so.13: cannot open shared object file
+        failed.append(f"{m}: {e}")
+if failed:
+    print("vllm ops: FAILED to load: " + "; ".join(failed))
+    print("[!] vLLM's compiled ops do not match torch or the driver: see the CUDA flavour "
+          "notes at the top of tools/setup_env.sh")
+else:
+    print("vllm ops: " + (", ".join(ops) + " load" if ops else "none found"))
 EOF
     exit 0
+fi
+
+DRIVER=$(driver_version)
+if [ -n "${WOCR_TORCH_BACKEND:-}" ]; then
+    FLAVOUR=$WOCR_TORCH_BACKEND
+    echo "[*] vLLM build: $FLAVOUR (WOCR_TORCH_BACKEND)"
+elif [ -n "$DRIVER" ]; then
+    FLAVOUR=$(flavour_for "$DRIVER")
+    echo "[*] vLLM build: $FLAVOUR (for driver $DRIVER)"
+else
+    FLAVOUR=cu130
+    echo "[!] ========================================================================"
+    echo "[!] No GPU driver is visible here (a login node), so the vLLM build cannot be"
+    echo "[!] matched to the GPU nodes' driver. Installing the CUDA 13 build ($VLLM_SPEC"
+    echo "[!] from PyPI), which needs driver >= 580. Run --gpu-check on a GPU node (see"
+    echo "[!] the end of this output): it says whether that driver can run it, and if"
+    echo "[!] not, how to reinstall (WOCR_TORCH_BACKEND=cu129, in a fresh env)."
+    echo "[!] ========================================================================"
+fi
+case "$FLAVOUR" in
+    cu130) ;;
+    cu12[0-9])
+        VLLM_VERSION="${VLLM_SPEC#vllm==}"
+        if [ -z "${WOCR_VLLM_WHEEL:-}" ] && [ "$VLLM_VERSION" = "$VLLM_SPEC" ]; then
+            echo "ERROR: the $FLAVOUR build needs an exact pin, WOCR_VLLM_SPEC=vllm==<version>" \
+                 "(or the wheel itself, WOCR_VLLM_WHEEL)" >&2
+            exit 2
+        fi ;;
+    *)
+        echo "ERROR: WOCR_TORCH_BACKEND=$FLAVOUR: expected cu130, cu129 or cu128" >&2
+        exit 2 ;;
+esac
+if [ -f "$ENV_PREFIX/wocr.flavour" ] && [ "$(cat "$ENV_PREFIX/wocr.flavour")" != "$FLAVOUR" ]; then
+    echo "ERROR: $ENV_PREFIX holds the $(cat "$ENV_PREFIX/wocr.flavour") build; the $FLAVOUR" \
+         "build needs a fresh env: rm -rf $ENV_PREFIX, then run this again" >&2
+    exit 2
 fi
 
 mkdir -p "$(dirname "$ENV_PREFIX")"
@@ -77,9 +171,15 @@ conda activate "$ENV_PREFIX"
 set -u
 
 pip install --no-cache-dir --upgrade pip uv
-# uv picks the torch build matching the requested CUDA flavour (vLLM's
-# recommended install path); plain pip would take whatever torch PyPI has.
-uv pip install --no-cache "$VLLM_SPEC" --torch-backend="$TORCH_BACKEND"
+if [ "$FLAVOUR" = cu130 ]; then
+    uv pip install --no-cache "$VLLM_SPEC"          # PyPI's vLLM and torch: CUDA 13
+else
+    # The release's CUDA 12 wheel, with torch from the matching PyTorch index
+    # (uv prefers the extra index), as vLLM's install docs do it.
+    uv pip install --no-cache "${WOCR_VLLM_WHEEL:-https://github.com/vllm-project/vllm/releases/download/v$VLLM_VERSION/vllm-$VLLM_VERSION+$FLAVOUR-cp38-abi3-manylinux_2_28_$(uname -m).whl}" \
+        --extra-index-url "https://download.pytorch.org/whl/$FLAVOUR"
+fi
+echo "$FLAVOUR" > "$ENV_PREFIX/wocr.flavour"
 uv pip install --no-cache -r requirements.txt
 
 # KaTeX for the formula validator (src/katex_check.py); optional — the
@@ -103,7 +203,7 @@ print(f"    torch {torch.__version__} (CUDA {torch.version.cuda}) | vllm {vllm._
 EOF
 
 echo
-echo "[*] done; package versions saved to $ENV_PREFIX/wocr.lock.txt. Next:"
+echo "[*] done ($FLAVOUR build); package versions saved to $ENV_PREFIX/wocr.lock.txt. Next:"
 echo "    activate the env in your own shell (this script's activation ended with it):"
 echo "      $ACTIVATE"
 echo "      srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1 \\"

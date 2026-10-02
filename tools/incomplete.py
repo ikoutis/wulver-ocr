@@ -9,21 +9,36 @@
 
 INPUTS is read the way slurm/ocr.sbatch reads it (IN=($INPUTS): split on
 whitespace, globs expanded), so a quoted "$INPUTS" works too; an argument
-that names an existing path is kept whole. The documents and their shards
-are exactly run_ocr's: ingest.discover(inputs)[i::nshards].
+that names an existing path is kept whole. Run it from the directory you
+submitted from, so relative paths name the same files. The documents and
+their shards are exactly run_ocr's: ingest.discover(inputs)[i::nshards],
+whose order does not depend on how a path is spelled (the sbatch script
+hands run_ocr absolute paths).
 
-A document is finished when <OUT>/<doc_id>/<doc_id>.md exists, or when
-<OUT>/<doc_id>/FAILED.json says it could not be ingested (terminal: running
-it again cannot help). An input that cannot be read at all (missing,
-unreadable) is skipped with a warning, as the pipeline skips it. Doc ids are
-computed from file contents (sha256), so this works before ingestion too.
-OUT defaults to $OUT, then to the sbatch script's default.
+A document is finished when <OUT>/<doc_id>/<doc_id>.md exists (OUT is the
+completion record: run_ocr does not redo it when its WORK has been purged),
+or when <OUT>/<doc_id>/FAILED.json says the file itself could not be
+ingested (terminal: running it again does not help). An input that cannot
+be read at all (missing, unreadable) is skipped with a warning, as the
+pipeline skips it. Doc ids are computed from file contents (sha256), so this
+works before ingestion too. OUT defaults to $OUT, then to the sbatch
+script's default.
+
+With --retry-failed, a document whose report.json lists failed pages (each
+assembled as a marked gap), or that has FAILED.json, counts as unfinished
+too. Resubmit those shards with READ_ARGS=--retry-failed, which re-reads the
+failed pages (a FAILED.json input is tried again anyway):
+
+    IDS=$(python tools/incomplete.py --inputs $INPUTS --nshards 8 --out "$OUT" --retry-failed)
+    [ -n "$IDS" ] && READ_ARGS=--retry-failed INPUTS="$INPUTS" OUT="$OUT" NSHARDS=8 \
+        sbatch --array=$IDS slurm/ocr.sbatch
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import sys
 
@@ -60,7 +75,8 @@ def split_inputs(args: list[str]) -> list[str]:
 
 
 def status(path: str, out_root: str) -> str:
-    """'done', 'failed' (terminal), 'unreadable' (skipped) or 'todo'."""
+    """'done', 'with failed pages' (done, with page_failed placeholders),
+    'failed' (could not be ingested), 'unreadable' (skipped) or 'todo'."""
     try:
         doc_id = make_doc_id(path, sha256_file(path))
     except OSError as e:
@@ -68,7 +84,12 @@ def status(path: str, out_root: str) -> str:
         return "unreadable"
     d = os.path.join(out_root, doc_id)
     if os.path.exists(os.path.join(d, doc_id + ".md")):
-        return "done"
+        try:
+            with open(os.path.join(d, "report.json"), encoding="utf-8") as f:
+                failed_pages = json.load(f).get("failed_pages")
+        except (OSError, ValueError):
+            failed_pages = None
+        return "with failed pages" if failed_pages else "done"
     if os.path.exists(os.path.join(d, "FAILED.json")):
         return "failed"
     return "todo"
@@ -81,6 +102,8 @@ def main(argv=None):
     ap.add_argument("--out", default=os.environ.get(
         "OUT", f"/project/ikoutis/{os.environ.get('USER', 'user')}/wocr/out"))
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="count documents with failed pages or FAILED.json as unfinished")
     args = ap.parse_args(argv)
     inputs = split_inputs(args.inputs)
     if not inputs:
@@ -92,17 +115,20 @@ def main(argv=None):
         paths = discover(inputs)    # sliced as run_ocr.select_docs slices it
     except OSError as e:            # an @listfile that cannot be read
         ap.error(str(e))
+    retried = ("with failed pages", "failed")
+    unfinished = ("todo", *retried) if args.retry_failed else ("todo",)
     bad = []
     for i in range(args.nshards):
         shard = paths[i::args.nshards]
-        n = {"done": 0, "failed": 0, "unreadable": 0, "todo": 0}
+        n = {"done": 0, "with failed pages": 0, "failed": 0, "unreadable": 0, "todo": 0}
         for p in shard:
             n[status(p, args.out)] += 1
-        if n["todo"]:
+        todo = sum(n[k] for k in unfinished)
+        if todo:
             bad.append(i)
         if args.list:
-            extra = ", ".join(f"{n[k]} {k}" for k in ("failed", "unreadable") if n[k])
-            print(f"shard {i:4d}: {len(shard) - n['todo']:5d}/{len(shard)} done"
+            extra = ", ".join(f"{n[k]} {k}" for k in (*retried, "unreadable") if n[k])
+            print(f"shard {i:4d}: {len(shard) - todo:5d}/{len(shard)} done"
                   + (f" ({extra})" if extra else ""))
     if not args.list:
         print(compress(bad))

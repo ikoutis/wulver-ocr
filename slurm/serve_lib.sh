@@ -10,8 +10,12 @@
 #     fixed one (a lost race for it is retried on another port);
 #   * "ready" means OUR server: our process is alive, our own log shows
 #     uvicorn's "Application startup complete" (an INFO line: keep vLLM's
-#     --uvicorn-log-level at its default, info), and /health answers on our
-#     port. Another job's server answering on that port does not count.
+#     --uvicorn-log-level at its default, info), our process (or a child of
+#     it) holds the socket listening on the port, and /health answers there.
+#     The socket is the proof: vLLM binds before loading the model and
+#     listens only after uvicorn has logged that line, so a server that lost
+#     a same-port race logs it too, and lives on for seconds while another
+#     job's server answers /health on that port.
 #
 # Usage (after sourcing a profile, see profiles/):
 #   source slurm/serve_lib.sh
@@ -42,6 +46,25 @@ server_url() {
 # appended to across requeues), contains $3.
 _wocr_log_has() {
     grep -q -- "$3" < <(tail -c +"$2" "$1")
+}
+
+# True if process $1, or a descendant of it, holds the socket that listens on
+# 127.0.0.1:$2 (its inode, from /proc/net/tcp, among the processes' fds).
+_wocr_owns_port() {
+    local inode
+    inode=$(awk -v a="$(printf '0100007F:%04X' "$2")" \
+        '$2 == a && $4 == "0A" { print $10; exit }' /proc/net/tcp 2>/dev/null)
+    [ -n "$inode" ] && _wocr_holds_socket "$1" "$inode"
+}
+
+_wocr_holds_socket() {
+    local child
+    [ -n "$(find "/proc/$1/fd" -lname "socket:\[$2\]" -print -quit 2>/dev/null)" ] &&
+        return 0
+    for child in $(cat /proc/"$1"/task/*/children 2>/dev/null); do
+        _wocr_holds_socket "$child" "$2" && return 0
+    done
+    return 1
 }
 
 # A USR1 recorded by requeue_lib.sh: requeue now rather than after start-up.
@@ -87,6 +110,7 @@ start_server() {
                 return 1
             fi
             if _wocr_log_has "$log" "$from" "Application startup complete" &&
+                    _wocr_owns_port "$pid" "$port" &&
                     curl -sf --max-time 10 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
                 WOCR_SERVER_PORTS[$name]=$port
                 echo "=== $name ready after $((SECONDS - t0))s on 127.0.0.1:$port ==="

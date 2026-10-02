@@ -30,8 +30,11 @@ Resumability. Every page is written atomically when it finishes, and every
 stage skips pages already on disk, so a preempted or requeued job resumes
 where it stopped. ``--force`` redoes a stage's finished pages; ``ingest
 --force`` also re-renders the page images and so discards that document's
-read/, review/ and figures/ (``all --force`` does not re-render). Review requests are pooled across
-the whole shard and each page is saved as soon as all its requests are done.
+read/, review/ and figures/ (``all --force`` does not re-render). Review
+requests are pooled across the whole shard and each page is saved as soon as
+all its requests are done. A document whose Markdown is in <out> but whose
+work dir is gone (WORK on /scratch is purged) counts as finished, as for
+tools/incomplete.py: <out> is the completion record (see select_docs).
 
 Failure semantics. A page whose reading fails deterministically (the server
 rejects the request, the adapter cannot parse the reply, the image cannot be
@@ -40,11 +43,13 @@ placeholder flagged ``page_failed`` so its document still assembles (report.json
 lists it; ``read --retry-failed`` tries again). A review request that fails
 deterministically is recorded as that block's final decision. A SERVER
 failure (unreachable, 5xx, timeouts) is never saved as done: the affected
-pages stay in ``todo`` and the command exits 3.
+pages stay in ``todo`` and the command exits 3. So does a SYSTEM failure
+while ingesting (disk full, quota, an I/O error): only an input that is
+itself unusable gets FAILED.json.
 
 Exit codes: 0 done; 85 stopped by SIGUSR1/SIGTERM after saving (requeue,
-see slurm/requeue_lib.sh); 3 model server failure (unfinished pages remain);
-2 usage error.
+see slurm/requeue_lib.sh); 3 model server or system failure (unfinished work
+remains); 2 usage error.
 """
 
 from __future__ import annotations
@@ -86,6 +91,11 @@ class ServerDown(Exception):
     """Some work could not be done because a model server failed."""
 
 
+class SystemFailure(Exception):
+    """Some input could not be ingested because of the system (disk full,
+    quota, an I/O error), not because of the input: nothing is marked."""
+
+
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -104,30 +114,71 @@ def parse_shard(s: str | None) -> tuple[int, int]:
 
 def select_docs(args) -> list[str]:
     """Doc dirs this invocation works on: from --inputs (ingesting as needed)
-    or every ingested doc under --work; then this shard's slice. An input
-    that cannot be ingested gets <out>/<doc_id>/FAILED.json (a terminal
-    state tools/incomplete.py counts as done) instead of blocking its shard."""
+    or every ingested doc under --work; then this shard's slice.
+
+    An input that cannot be ingested gets <out>/<doc_id>/FAILED.json (a
+    terminal state tools/incomplete.py counts as done) instead of blocking
+    its shard; one that cannot be read at all is skipped. A failure of the
+    system rather than of the input (disk full, quota, an I/O error) marks
+    nothing: the other inputs are ingested, then SystemFailure is raised.
+    A document whose Markdown is in <out> but whose work dir is gone (WORK on
+    /scratch is purged) is finished, as tools/incomplete.py says: it is not
+    read again, unless --force, or --retry-failed and it has failed pages."""
     i, n = parse_shard(args.shard)
     if args.inputs:
         paths = ing.discover(args.inputs)[i::n]
-        ids = []
+        ids, system, purged = [], [], 0
         for p in paths:
             check_stop()
             try:
-                doc_id = ing.ingest(p, args.work, dpi=args.dpi,
-                                    force=args.force and args.cmd == "ingest")["doc_id"]
+                digest = ing.sha256_file(p)
+                doc_id = ing.make_doc_id(p, digest)
+                if _finished_and_purged(args, doc_id):
+                    purged += 1
+                    continue
+                ing.ingest(p, args.work, dpi=args.dpi, digest=digest,
+                           force=args.force and args.cmd == "ingest")
                 ids.append(doc_id)
                 stale = os.path.join(args.out or args.work, doc_id, "FAILED.json")
                 if os.path.exists(stale):   # an earlier failure was transient
                     os.remove(stale)
             except Exception as e:      # noqa: BLE001 — a corrupt file is marked, loudly
                 log(f"INGEST ERROR {p}: {e!r}")
-                _mark_ingest_failed(args, p, e)
+                # A failed system call on a readable input is the system's
+                # fault. (Pillow's decoding errors are OSErrors without errno.)
+                if isinstance(e, OSError) and e.errno is not None and os.access(p, os.R_OK):
+                    system.append(f"{p}: {e!r}")
+                else:
+                    _mark_ingest_failed(args, p, e)
+        if purged:
+            log(f"{purged} document(s) already finished in {args.out or args.work} "
+                "(work dirs purged): not redone")
+        if system:
+            raise SystemFailure(f"{len(system)} input(s) not ingested, e.g. {system[0]}")
         ids = list(dict.fromkeys(ids))  # the same file twice is one document
         return [os.path.join(args.work, d) for d in ids]
     docs = sorted(d for d in os.listdir(args.work)
                   if os.path.exists(os.path.join(args.work, d, "manifest.json")))
     return [os.path.join(args.work, d) for d in docs[i::n]]
+
+
+def _finished_and_purged(args, doc_id: str) -> bool:
+    """True if the document is finished in <out> but its work dir is gone:
+    then it is not ingested, read and reviewed again (see select_docs)."""
+    if args.force or os.path.exists(os.path.join(args.work, doc_id, "manifest.json")):
+        return False
+    out_dir = os.path.join(args.out or args.work, doc_id)
+    if not os.path.exists(os.path.join(out_dir, doc_id + ".md")):
+        return False
+    return not (getattr(args, "retry_failed", False) and _report_failed_pages(out_dir))
+
+
+def _report_failed_pages(out_dir: str) -> list:
+    try:
+        with open(os.path.join(out_dir, "report.json"), encoding="utf-8") as f:
+            return json.load(f).get("failed_pages") or []
+    except (OSError, ValueError):
+        return []
 
 
 def _mark_ingest_failed(args, path: str, err: Exception) -> None:
@@ -246,6 +297,19 @@ def _page_failed(path: str) -> bool:
         return True                     # unreadable JSON: read it again
 
 
+def _to_read(args, doc_dir: str, k: int) -> bool:
+    """Whether the read stage reads page k (stage_todo counts the same)."""
+    path = os.path.join(doc_dir, "read", page_stem(k) + ".json")
+    return args.force or not os.path.exists(path) or (args.retry_failed and _page_failed(path))
+
+
+def _to_review(args, doc_dir: str, k: int) -> bool:
+    """Whether the review stage reviews page k: only a page that was read."""
+    stem = page_stem(k) + ".json"
+    return os.path.exists(os.path.join(doc_dir, "read", stem)) and (
+        args.force or not os.path.exists(os.path.join(doc_dir, "review", stem)))
+
+
 def stage_read(args):
     client = ChatClient(args.reader_url, args.reader_model, timeout=args.timeout,
                         default_extra=_json_arg(args.reader_extra))
@@ -255,12 +319,7 @@ def stage_read(args):
     docs = select_docs(args)
     todo = []
     for d in docs:
-        n = load_manifest(d)["n_pages"]
-        for k in range(n):
-            path = os.path.join(d, "read", page_stem(k) + ".json")
-            if args.force or not os.path.exists(path) or (
-                    args.retry_failed and _page_failed(path)):
-                todo.append((d, k))
+        todo += [(d, k) for k in range(load_manifest(d)["n_pages"]) if _to_read(args, d, k)]
     log(f"read: {len(todo)} page(s) to do across {len(docs)} document(s)")
     t0 = time.time()
     results = map_concurrent(lambda dk: _read_one(reader, dk[0], dk[1], args.retries),
@@ -317,12 +376,9 @@ def stage_review(args):
     items: list[tuple] = []
     for d in select_docs(args):
         for k in range(load_manifest(d)["n_pages"]):
-            if not args.force and os.path.exists(
-                    os.path.join(d, "review", page_stem(k) + ".json")):
+            if not _to_review(args, d, k):
                 continue
             p = load_page(d, "read", k)
-            if p is None:
-                continue
             its = [("block", i) for i, b in enumerate(p.blocks) if policy.wants(b)]
             if args.describe_figures:
                 its += [("figure", i) for i, b in enumerate(p.blocks) if needs_description(b)]
@@ -412,6 +468,8 @@ def make_report(man: dict, pages: list[Page]) -> dict:
         "failed_pages": [p.index + 1 for p in pages if p.meta.get("failed")],
         "truncated_pages": [p.index + 1 for p in pages if any(
             b.meta.get("truncated_tail") and not b.content.strip() for b in p.blocks)],
+        "truncated_recovered": [p.index + 1 for p in pages if any(
+            b.meta.get("tail_recovered") for b in p.blocks)],
         "review_errors": sum(1 for b in blocks if b.meta.get("reviewed") == "error"
                              or b.meta.get("description_error")),
         "block_types": dict(Counter(b.type for b in blocks)),
@@ -444,18 +502,12 @@ def stage_status(args):
 
 
 def stage_todo(args):
-    """Print the number of pages a stage still has to do (used by the sbatch
-    script to skip starting a model server for a finished phase)."""
-    n = 0
-    for d in select_docs(args):
-        man = load_manifest(d)
-        for k in range(man["n_pages"]):
-            stem = page_stem(k) + ".json"
-            read = os.path.exists(os.path.join(d, "read", stem))
-            if args.stage == "read":
-                n += not read
-            else:   # only pages that have been read can be reviewed
-                n += read and not os.path.exists(os.path.join(d, "review", stem))
+    """Print the number of pages a stage still has to do, counted as that
+    stage counts them with the same --force / --retry-failed (used by the
+    sbatch script to skip starting a model server for a finished phase)."""
+    wanted = _to_read if args.stage == "read" else _to_review
+    n = sum(wanted(args, d, k) for d in select_docs(args)
+            for k in range(load_manifest(d)["n_pages"]))
     print(n)
     return n
 
@@ -532,6 +584,8 @@ def build_parser() -> argparse.ArgumentParser:
             f(p)
         if name == "todo":
             p.add_argument("--stage", choices=["read", "review"], required=True)
+            p.add_argument("--retry-failed", action="store_true",
+                           help="count failed placeholders too, as read --retry-failed does")
     return ap
 
 
@@ -550,6 +604,10 @@ def main(argv=None) -> int:
     except Stopped:
         log(f"stopped by signal; finished pages saved — exit {EXIT_REQUEUE} (requeue)")
         return EXIT_REQUEUE
+    except SystemFailure as e:
+        log(f"SYSTEM FAILURE: {e}. Nothing was marked failed; fix the cause (space, "
+            f"quota, file system) and run again — exit {EXIT_SERVER}")
+        return EXIT_SERVER
     except (ServerDown, ServerError) as e:
         if STOP.is_set():   # at preemption the server is killed too: requeue
             log(f"stopped by signal (server gone too: {e}) — exit {EXIT_REQUEUE}")

@@ -10,7 +10,9 @@
 #
 # Serving flags follow each model's own published launch settings; the
 # reader's are datalab's H100-80GB baseline (same memory as our A100s).
-# To be confirmed by the [O-002] smoke run.
+# Confirmed in [O-002] on one A100-80GB: the reader is ready 266 s after
+# start (55 GB of KV cache), the reviewer 320 s after; see the log entry
+# for the measured throughput. Both need vLLM's own sampler (ocr.sbatch).
 
 # ---- reader (stage 1) ----------------------------------------------------------
 READER_ADAPTER=chandra                    # src/readers/chandra.py

@@ -455,13 +455,15 @@ use and the nodes cannot), and vLLM's Triton kernels compile with Triton's own b
 compiler. The env's `lib` goes first on `LD_LIBRARY_PATH` for the `vllm` command's C++ runtime
 (both from [O-002]).
 
-**Throughput (to be measured in [O-002]).** The rough expectation for one A100:
-
-- the reader at ~1 page/s for Chandra 2, more for the smaller readers;
-- the reviewer on ~5–15 crops per page of a math paper, at a few crops per second with batching.
-
-That puts a 20-page paper at about a minute of GPU time end to end, and 10,000 pages at a few
-GPU-hours per stage. These are guesses. The first smoke run replaces them with measurements.
+**Throughput.** The expectation for one A100 was the reader at ~1 page/s for Chandra 2 and
+the reviewer at a few crops per second with batching: a 20-page paper in about a minute of GPU
+time end to end, 10,000 pages in a few GPU-hours per stage. The [O-002] smoke run (13 pages,
+3 documents) measured: the reader ready 266 s after its start, 13 pages read in 27 s (0.5
+page/s, with 13 pages far too few to fill its batch); the reviewer ready 320 s after its start,
+30 requests (24 formula verdicts, 6 figure descriptions) over 13 pages in 19 s. So a task's
+fixed cost is ~10 minutes of model loading, which is why documents are sharded into few,
+long-running tasks rather than one task per paper; the per-page rates need a run of hundreds
+of pages to measure properly.
 
 ## 6. Output format
 
@@ -578,7 +580,7 @@ maximise net formula accuracy. Because of degrading levels, this can be done per
 | # | milestone | content | entry |
 |---|---|---|---|
 | M0 | scaffold | pipeline, reader adapters (Chandra 2, dots, Markdown, olmOCR), gated reviewer, KaTeX validator, figure describer with TikZ graphs, assembly, Wulver tooling, CPU test suite; hardened by an adversarial code review ([O-004]) and two verifications ([O-005], [O-006]) | [O-001], [O-004], [O-005], [O-006] |
-| M1 | smoke run on Wulver | env + weights staged; 3–5 papers end to end; measured pages/s, GPU memory, review decisions; fix whatever the real models do differently from their docs (prompt formats, box frames, served names) | [O-002] |
+| M1 | smoke run on Wulver | done: env + weights staged; 3 documents (13 pages) end to end on one A100 after four environment fixes; load times and review decisions measured; the real models' output fixed where it differed (list numbering); pages/s still needs a larger run | [O-002] |
 | M2 | evaluation set + metrics | arXiv-source builder (`eval/build_arxiv.py`), formula normaliser, CDM via a headless KaTeX render, TEDS, edit distance; A0 vs A1 on ~50 papers × 4 degradation levels | — |
 | M3 | bake-off + calibration | A2–A5; pick the default reader/reviewer pair from data; calibrate the gate thresholds | — |
 | M4 | production | the real corpus in sharded arrays; a single-paper command for interactive use (OnDemand session) | — |

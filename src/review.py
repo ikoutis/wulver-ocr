@@ -30,6 +30,9 @@ Which blocks are reviewed is a policy: every block with a validator flag, plus
 every block whose type is in ``review_types`` (formulas by default — the
 emphasis of this project, and the place where a single wrong subscript
 matters).
+
+The reviewer sees the page the way the reader read it: a page olmOCR read
+turned (meta["rotation"]) is turned the same way before the crop.
 """
 
 from __future__ import annotations
@@ -46,7 +49,15 @@ from .backend import (TRUNCATION_MARKER, ChatClient, ServerError, Stopped, check
 from .schema import Block, Page
 from .validate import outside_math, strip_math_delims, validate_block
 
+# A draft is degenerate when its content is: empty, looping, or cut off. The
+# reader markers "repeated" (one kept copy of an element the model wrote
+# several times) and "json_repaired" are flags, but their text is an ordinary
+# reading, so they keep the flagged change limit and the escape check.
 DEGENERATE = {"empty", "repetition", "truncated"}
+# The turns OlmOCRReader reads a page with (readers.markdown._TURN), keyed by
+# meta["rotation"]: the reviewer is shown the page turned the same way.
+_TURN = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
+         270: Image.Transpose.ROTATE_270}
 # check_latex runs KaTeX only on structurally sound LaTeX, so a draft with one
 # of these flags was never KaTeX-checked (see gate).
 _STRUCTURAL = {"latex_braces", "latex_env", "latex_leftright", "latex_delims"}
@@ -64,11 +75,32 @@ _ESCAPES = {r"\*": r"(?<!\\)\*", r"\_": r"(?<!\\)_", r"\`": r"(?<!\\)`",
 # Answers to "transcribe this region" that are not a transcription: a bare
 # number (the page number at the foot of a tail crop), a placeholder, or a
 # one-line note about the crop. (Answers without a letter or digit are
-# caught too.)
+# caught too.) A note is recognised by how it starts ("(nothing to
+# transcribe ...)", "[blank]", "(no text ...)", "(page number 7)", "(The
+# image is blank.)") or by "transcribe"/"transcription" in it, and it never
+# has math in it. A parenthetical remark of the paper's own that merely uses
+# such a word ("(If $S$ is empty, there is nothing to prove.)") is a
+# transcription.
+_NOTE_END = r"(?=\s*(?:[.:;,!)\]]|\s[-\u2013\u2014]))"
 _PLACEHOLDER = re.compile(
     r"[\W_]*(?:\d+|n/?a|none|empty|blank|nothing(?: else)?(?: to transcribe)?)[\W_]*"
-    r"|[(\[][^()\[\]\n]*\b(?:transcri\w*|nothing|blank|empty|illegible|page numbers?)\b"
-    r"[^()\[\]\n]*[)\]]", re.I)
+    r"|[(\[]\s*(?![^()\[\]\n]*[$\\])(?:(?:"
+    r"nothing(?:" + _NOTE_END + r"|\s+(?:else|more|further|to\s+transcribe|visible|legible"
+    r"|readable|shown|here|in|on|but|except|apart|besides)\b)"
+    r"|no\s+(?:other\s+|more\s+|further\s+|additional\s+|legible\s+|visible\s+"
+    r"|readable\s+)?(?:text|content|transcription)\b"
+    r"|(?:blank|empty|illegible|unreadable)(?:\s+(?:region|crop|image|area|page|space"
+    r"|line))?" + _NOTE_END +
+    r"|only\s+(?:a\s+|the\s+|one\s+)?(?:page\s+numbers?|footer|running\s+head)"
+    r"|(?:the\s+|this\s+)?(?:region|crop|image|area)\b[^()\[\]\n]*?\b(?:blank|empty"
+    r"|illegible|unreadable|nothing|only|page\s+numbers?)\b"
+    r"|[^()\[\]\n]*?\btranscri(?:be|bed|bing|ption)\b"
+    r")[^()\[\]\n]*"
+    r"|(?:a\s+|the\s+)?page\s+numbers?(?:\s*:?\s*['\"]?[0-9ivxlc]+['\"]?)?(?:\s+only)?"
+    r"\s*\.?\s*)[)\]]", re.I)
+# What the issues line tells the reviewer about a flag that is not self-explanatory.
+_FLAG_NOTE = {"repeated": "repeated (the OCR wrote this element more than once; "
+                          "this is the one copy kept)"}
 
 _COMMON_RULES = """Rules:
 - Transcribe only what is visible in the image. Never add, complete, or summarise.
@@ -253,23 +285,52 @@ def change_fraction(a: str, b: str) -> float:
     return 1.0 - difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
+# A text-mode group in LaTeX (\\text{ and }, \\textrm, \\mbox, \\tag{..}): its
+# spaces render. (\\textstyle is a math style switch, not a text group.)
+_TEXT_GROUP = re.compile(r"(\\(?:text(?!style)[A-Za-z]*|mbox|hbox|fbox|tag\*?))\s*"
+                         r"\{((?:[^{}]|\{[^{}]*\})*)\}")
+# A Markdown line that starts a list item: its indentation decides the nesting.
+_LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
+
+
 def same_text(a: str, b: str, kind: str) -> bool:
-    """Equal up to whitespace that does not matter: in LaTeX, all of it
-    except between two letters ("\\in S" is not "\\inS") and after a
-    backslash (a control space); in Markdown, all but the line structure
-    (list items, table rows, paragraphs)."""
+    """Equal up to whitespace that does not matter. In LaTeX, that is all of
+    it except between two letters ("\\in S" is not "\\inS"), after a
+    backslash (a control space), and inside a text-mode group ("\\text{and}"
+    is not "\\text{ and }"). In Markdown, it is all but the line structure
+    (list items, table rows, paragraphs) and the indentation of a line that
+    starts a list item or a block (it decides what nests in what); a
+    paragraph's continuation lines may be indented any way."""
     def norm(s: str) -> str:
         if kind == "formula":
-            return re.sub(r"(?<![A-Za-z\\]) |(?<!\\) (?![A-Za-z])", "", " ".join(s.split()))
-        lines = "\n".join(" ".join(ln.split()) for ln in s.strip().splitlines())
-        return re.sub(r"\n{3,}", "\n\n", lines)
+            s = _TEXT_GROUP.sub(lambda m: m.group(1) + "{" + m.group(2).replace(" ", "\0")
+                                + "}", " ".join(s.split()))
+            return re.sub(r"(?<![A-Za-z\\]) |(?<!\\) (?![A-Za-z])", "", s)
+        lines, starts_block = [], True
+        for ln in s.strip().splitlines():
+            text = " ".join(ln.split())
+            indent = ln[:len(ln) - len(ln.lstrip())]
+            keep = text and (starts_block or _LIST_ITEM.match(ln))
+            lines.append((indent if keep else "") + text)
+            starts_block = not text
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
     return norm(a) == norm(b)
 
 
-def dropped_escapes(draft: str, proposal: str) -> list[str]:
+# The tags of an HTML table (those htmlmd.table_html writes, and the few a
+# reviewer adds restoring one): structure, not a '<' that an escape was
+# keeping from opening a tag. A table's are taken out before counting.
+_TABLE_TAG = re.compile(r"</?(?:table|thead|tbody|tfoot|tr|td|th|caption|colgroup|col|br|sup"
+                        r"|sub|b|i|strong|em)\b[^<>]*>", re.I)
+
+
+def dropped_escapes(draft: str, proposal: str, kind: str = "text") -> list[str]:
     """The draft's escapes that the proposal turned into markup: fewer of
-    the escape and more of its bare form, outside math."""
+    the escape and more of its bare form, outside math (and, for a table,
+    outside its tags: a restored <td> is not a dropped '&lt;')."""
     d, p = outside_math(draft), outside_math(proposal)
+    if kind == "table":
+        d, p = _TABLE_TAG.sub("\0", d), _TABLE_TAG.sub("\0", p)
     return [esc for esc, bare in _ESCAPES.items()
             if p.count(esc) < d.count(esc)
             and len(re.findall(bare, p)) > len(re.findall(bare, d))]
@@ -301,8 +362,9 @@ def gate(block: Block, proposal: str, policy: ReviewPolicy) -> tuple[bool, str]:
             return False, "not a transcription"
         return True, "draft degenerate; reviewer re-read accepted"
     draft = _draft(block.content)
-    if prompt_kind(block.type) != "formula":
-        lost = dropped_escapes(draft, proposal)
+    kind = prompt_kind(block.type)
+    if kind != "formula":
+        lost = dropped_escapes(draft, proposal, kind)
         if lost:
             return False, f"drops Markdown escapes {lost}"
     # latex_unchecked says nothing against the draft: it keeps the tight bound
@@ -343,12 +405,17 @@ def _review_block(client: ChatClient, page_img: Image.Image, block: Block,
     kind = prompt_kind(block.type)
     draft = _draft(block.content)
     if draft:
-        issues = (f"\nAutomatic checks flagged: {', '.join(block.flags)}.\n"
+        issues = (f"\nAutomatic checks flagged: "
+                  f"{', '.join(_FLAG_NOTE.get(f, f) for f in block.flags)}.\n"
                   if block.flags else "\n")
         prompt = _PROMPTS[kind].format(draft=draft, issues=issues, rules=_COMMON_RULES)
     else:
         what, form = _TRANSCRIBE_KIND[kind]
         prompt = _TRANSCRIBE.format(what=what, form=form, tag=_OUT_TAG[kind])
+    rotation = block.meta.get("rotation")
+    turn = _TURN.get(rotation) if isinstance(rotation, int) else None
+    if turn is not None:            # the reader read this page turned: show it the same way
+        page_img = page_img.transpose(turn)
     reply = client.chat([image_part(crop(page_img, block.bbox, policy.pad)),
                          text_part(prompt)], max_tokens=4096)
     verdict, proposal = parse_reply(reply, kind, draft)

@@ -76,6 +76,8 @@ Caption (may be empty): "<<CAPTION>>"
      v1, v2, ... left-to-right, top-to-bottom). One \draw per edge: -- for straight edges, [->] if
      directed, to[bend left/right] for curved ones, node[midway, auto] {...} for an edge weight or
      label. Include every vertex and every edge, and nothing that is not drawn. No \foreach.
+     Several panels: one tikzpicture, each panel in its own \begin{scope}[xshift=...], with
+     vertex names unique across panels (a1, a2, ... and b1, b2, ...).
    - diagram: Mermaid flowchart code.
    - commutative_diagram: tikz-cd code (\begin{tikzcd} ... \end{tikzcd}).
    - plot: one line per series with approximate key values, only if legible.

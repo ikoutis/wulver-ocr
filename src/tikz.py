@@ -21,12 +21,14 @@ labels after the target, node options in any order, a vertex label given as
 ``label=above:$v_1$``, any arrow spec (``<-``, ``latex-latex``,
 ``-{Stealth[length=2mm]}``), arrows set for the whole picture or a scope or
 through a style (``name/.style={..}`` in the picture's or a scope's options,
-``\\tikzset``, ``\\tikzstyle``, ``every edge``), and comments.
+``\\tikzset``, ``\\tikzstyle``, ``every edge``), arrows a markings
+decoration draws along an edge (the mid-arrow style ``->-``), and comments.
 That gives:
   * checks — braces balance, one picture (a figure with several panels is
-    drawn as one, with scopes), every edge's endpoints are declared
-    vertices, the picture has vertices, every statement that draws
-    something was understood, no constructs we cannot verify (\\foreach);
+    drawn as one, with scopes, and vertex names unique across the panels),
+    every edge's endpoints are declared vertices, the picture has vertices,
+    every statement that draws something was understood, no constructs we
+    cannot verify (\\foreach);
   * data — the vertex/edge lists go into the page JSON (meta["graph"]), so
     graphs are queryable and can be scored against ground truth (design §7).
 """
@@ -49,6 +51,12 @@ _LABEL_POS = re.compile(r"\s*(?:[-+]?\d+(?:\.\d+)?|(?:above|below|left|right|nor
 _HEAD = re.compile(
     r"[{|\s]*(?:(?:open|straight|arc|classical\s+tikz|computer\s+modern)\s+)?"
     r"(?:<|>|latex|stealth|to\b|triangle|angle|kite|barb|implies|imply|rightarrow)", re.I)
+# An arrow drawn by a decoration on the path (the mid-arrow idiom
+# decoration={markings, mark=at position .5 with {\arrow{>}}}): its tip, and
+# whether it is \arrowreversed.
+_MARK_ARROW = re.compile(r"\\arrow(reversed)?\s*(?:\[[^\]]*\])?\s*"
+                         r"\{((?:[^{}]|\{[^{}]*\})*)\}")
+_DECORATE = re.compile(r"\bdecorate\b")
 
 
 def strip_comments(code: str) -> str:
@@ -197,24 +205,52 @@ def _expand(opts: str, styles: dict, depth: int = 0) -> str:
     return ",".join(out)
 
 
+def _marked(value: str) -> set:
+    """The ways the arrows of a decoration value point along the path
+    (markings with \\arrow{<tip>}): a subset of {'forward', 'back'}."""
+    ways = set()
+    for rev, tip in _MARK_ARROW.findall(value):
+        if _HEAD.match(tip):
+            back = tip.strip().lstrip("{").startswith("<")
+            if rev or re.search(r"\breversed\b", tip):      # \arrowreversed, {Stealth[reversed]}
+                back = not back
+            ways.add("back" if back else "forward")
+    return ways
+
+
 def _direction(opts: str) -> Optional[str]:
     """The arrows an option list sets: 'forward', 'back', 'both', 'none' (an
     explicit '-', or tips without a head), or None when it sets no arrows.
     The arrow spec is the option with a '-' outside groups and no '=' (so
     out=-30 and >=stealth are not specs), or the value of arrows=; the two
     sides of that '-' are the start and end tips. As in TikZ, the last
-    spec wins."""
-    found = None
+    spec wins. Arrows a decoration draws along the path add to that
+    (decoration={markings, mark=... with {\\arrow{>}}} with
+    postaction={decorate}, as the mid-arrow style ->- expands to), when the
+    same list applies the decoration."""
+    found, marks, decorated = None, set(), False
     for item in _split_top(opts, ","):
         kv = _split_top(item, "=", 1)
+        key = kv[0].strip()
+        if len(kv) == 2 and key in ("decoration", "postaction", "preaction"):
+            marks |= _marked(kv[1])
+            decorated = decorated or (key != "decoration" and bool(_DECORATE.search(kv[1])))
+            continue
+        if len(kv) == 1 and key == "decorate":
+            decorated = True
+            continue
         if len(kv) == 2:
-            if kv[0].strip() != "arrows":
+            if key != "arrows":
                 continue
             item = _unbrace(kv[1])      # arrows={-Latex}
         sides = _split_top(item, "-", 1)
         if len(sides) == 2:
             start, end = (bool(_HEAD.match(x)) for x in sides)
             found = ("both" if start else "forward") if end else ("back" if start else "none")
+    if marks and decorated:
+        ways = marks | ({"forward", "back"} if found == "both" else
+                        {found} if found in ("forward", "back") else set())
+        return "both" if len(ways) == 2 else ways.pop()
     return found
 
 
@@ -371,6 +407,13 @@ def _settings(sc: _Scan, scopes: list[str], styles: dict) -> None:
             return
 
 
+# TikZ node names are global to the picture, so panels that reuse vertex
+# names (G and its complement on 1..4) need new ones.
+_PANELS = ("more than one tikzpicture: draw all panels in one picture, each in its own "
+           "\\begin{scope}[xshift=...], with vertex names unique across panels "
+           "(a1, a2, ... in the first, b1, b2, ... in the second; labels may repeat)")
+
+
 def parse_graph(code: str) -> tuple[Optional[dict], list[str], list[str]]:
     """-> (graph or None, flags, human-readable problems)."""
     code = strip_comments(normalise(code))
@@ -381,8 +424,7 @@ def parse_graph(code: str) -> tuple[Optional[dict], list[str], list[str]]:
     if not pictures:
         return None, ["tikz_parse"], ["no \\begin{tikzpicture} ... \\end{tikzpicture}"]
     if len(pictures) > 1:
-        return None, ["tikz_parse"], ["more than one tikzpicture: draw all panels in one "
-                                      "picture, each in its own \\begin{scope}[xshift=...]"]
+        return None, ["tikz_parse"], [_PANELS]
     outside = _ENV.sub(" ", code)
     if _DRAWING.search(outside):
         return None, ["tikz_parse"], ["drawing commands outside the tikzpicture"]
@@ -430,7 +472,10 @@ def parse_graph(code: str) -> tuple[Optional[dict], list[str], list[str]]:
         problems.append("no \\node vertices declared")
     if len(set(ids)) != len(ids):
         flags.append("tikz_parse")
-        problems.append("duplicate vertex names")
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        problems.append(f"duplicate vertex names: {', '.join(dup)}. Every \\node needs its "
+                        "own name, unique across panels (a1, a2, ... and b1, b2, ...); "
+                        "labels may repeat")
     missing = sorted({e[k] for e in edges for k in ("u", "v")} - set(ids))
     if missing:
         flags.append("tikz_undeclared")

@@ -213,9 +213,9 @@ class TestUnclosedDisplayMath:                  # v2-gate-9
 class TestReaderMarkers:                        # contract 2 (readers2 -> gate2)
     def test_markers_become_flags(self):
         assert block("text", "Fine text.", json_repaired=True).flags == ["json_repaired"]
-        assert block("text", "Fine text.", repeated=3).flags == ["repetition"]
+        assert block("text", "Fine text.", repeated=3).flags == ["repeated"]       # [gate3]
         assert block("text", "Fine text.", repeated=1).flags == []
-        assert block("figure", "", repeated=2).flags == ["repetition"]
+        assert block("figure", "", repeated=2).flags == ["repeated"]
 
     def test_json_repaired_is_reviewed_under_the_flagged_bound(self):
         b = block("formula", r"\frac{a}{b} + \theta", json_repaired=True)
@@ -225,12 +225,12 @@ class TestReaderMarkers:                        # contract 2 (readers2 -> gate2)
         b, _ = review(b, reply("fixed", r"\frac{a}{b} + \Theta", "latex"))
         assert b.meta["reviewed"] == "edited" and b.flags == []     # the reviewer's text now
 
-    def test_repeated_is_degenerate(self):
+    def test_repeated_is_reviewed(self):     # no longer degenerate: see test_fix_gate3
         b, _ = review(block("text", "A paragraph.", repeated=12),
                       reply("fixed", "A paragraph, read again."))
         assert b.meta["reviewed"] == "edited" and b.flags == []
         b, _ = review(block("text", "A paragraph.", repeated=12), reply("correct", ""))
-        assert b.meta["reviewed"] == "agreed" and b.flags == ["repetition"]
+        assert b.meta["reviewed"] == "agreed" and b.flags == ["repeated"]
 
 
 AB = r"\node (a) at (0,0) {$a$}; \node (b) at (1,0) {$b$}; "

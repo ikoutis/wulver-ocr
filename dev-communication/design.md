@@ -131,12 +131,32 @@ All model traffic goes over localhost HTTP to `vllm serve`, in the OpenAI chat f
 (`src/backend.py`). The pipeline never imports vLLM. As a result, the serving stack can be
 upgraded or swapped (pip wheel, Apptainer container, SGLang) without touching the pipeline. The
 same code also runs against any endpoint, so a laptop can talk to a server through a tunnel.
-Throughput comes from concurrency: 32–64 requests in flight, batched by vLLM.
+Throughput comes from concurrency: 32–64 requests in flight, batched by vLLM. The review
+stage pools every block and figure of every unreviewed page in the shard into one queue, so
+the reviewer stays busy across document boundaries.
 
 Every stage reads and writes the same page JSON (`src/schema.py`). Pages are written atomically
 and stages skip finished pages, so preemption costs at most the pages in flight. The JSON is
 also the provenance record. Every block names the model that wrote it, its flags, and its edit
 history.
+
+**Failure semantics** decide what counts as done:
+
+- **Stop request** (SIGUSR1 at preemption or before the wall clock). No new request starts, the
+  ones in flight finish, every finished page is saved, and the command exits 85 so the task
+  requeues itself.
+- **Model server failure** (unreachable, 5xx, timeouts). Nothing unfinished is saved as done.
+  A circuit breaker stops a dead server from costing every remaining item its full retry
+  schedule. The stage exits 3, and the pages stay in `todo`.
+- **Deterministic failure of one request** (a 4xx with the server's reason, or an unparseable
+  reply). A review request that fails this way becomes that block's final decision. A page the
+  reader cannot read is retried once with different decoding, then saved as a placeholder
+  flagged `page_failed`, so its document still assembles; `read --retry-failed` retries such
+  pages later.
+- **An input that cannot be ingested** gets `<out>/<doc_id>/FAILED.json`, a terminal state that
+  `tools/incomplete.py` counts as done.
+
+None of these can block a shard forever or pass off unfinished work as finished.
 
 **Readers are adapters** (`src/readers/`). Each one maps a model's native output onto the common
 block vocabulary: title, heading, text, list, formula, table, figure, caption, footnote,
@@ -230,10 +250,12 @@ PureDocBench, and it will join the bake-off (A5) once its licence is published.
   track). That is above every specialist on that track, and judging degraded crops is exactly
   the reviewer's job.
 - It is served with `--reasoning-parser qwen3`. Thinking is off by default (one short comparison
-  per crop). The profile sets this through `EDITOR_REQUEST_EXTRA`, and whether thinking buys
-  formula accuracy is an M3 measurement.
-- The client also strips any inline `<think>` text, so a misconfigured server cannot leak
-  reasoning into the output.
+  per crop). The profile sets this through `EDITOR_REQUEST_EXTRA` (the stage-by-stage CLI takes
+  the same JSON as `--editor-extra`), and whether thinking buys formula accuracy is an M3
+  measurement.
+- As a second line of defence, the client strips inline reasoning: `<think>…</think>`
+  blocks, a bare `…</think>` (when the chat template opened `<think>` itself), and an
+  unterminated `<think>`.
 - Licence: per its model card; the survey reports Apache-2.0†.
 
 The fallback is Qwen3-VL-32B-Instruct (Apache-2.0, standard attention, the most mature vLLM path
@@ -340,7 +362,8 @@ VS Code, and MkDocs with arithmatex:
 
 - Display math is `$$ … $$` on its own lines; equation numbers are kept as `\tag{n}`.
 - Inline math is `$…$`.
-- Tables are GFM, or HTML when cells are merged.
+- Tables are HTML from the layout readers (so merged cells survive), and GFM from the
+  Markdown reader. Converting simple HTML tables to GFM is a possible later nicety.
 - Headings are `#` for the title and `##`/`###` for sections.
 - Each figure is `![alt](figures/p0003_b05.png)` followed by a collapsible
   `<details><summary>Figure description (generated)</summary>`. Inside it are a kind, a
@@ -429,7 +452,7 @@ maximise net formula accuracy. Because of degrading levels, this can be done per
 
 | # | milestone | content | entry |
 |---|---|---|---|
-| M0 | scaffold *(this commit)* | pipeline, three reader adapters (Chandra 2, dots, Markdown), gated reviewer, KaTeX validator, figure describer, assembly, Wulver tooling, 86 CPU tests | [O-001] |
+| M0 | scaffold | pipeline, reader adapters (Chandra 2, dots, Markdown, olmOCR), gated reviewer, KaTeX validator, figure describer with TikZ graphs, assembly, Wulver tooling, CPU test suite; hardened by an adversarial code review ([O-004]) | [O-001], [O-004] |
 | M1 | smoke run on Wulver | env + weights staged; 3–5 papers end to end; measured pages/s, GPU memory, review decisions; fix whatever the real models do differently from their docs (prompt formats, box frames, served names) | [O-002] |
 | M2 | evaluation set + metrics | arXiv-source builder (`eval/build_arxiv.py`), formula normaliser, CDM via a headless KaTeX render, TEDS, edit distance; A0 vs A1 on ~50 papers × 4 degradation levels | — |
 | M3 | bake-off + calibration | A2–A5; pick the default reader/reviewer pair from data; calibrate the gate thresholds | — |

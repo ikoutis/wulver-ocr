@@ -16,9 +16,14 @@ image crop plus the reader's draft — and its proposal is accepted only if
      in which case the reviewer is the fallback reader for that block.
 Rejected proposals are kept in the block's history, so the gate's decisions
 are auditable and its thresholds tunable from data (see design.md §Eval).
+A proposal that differs from the draft only in whitespace counts as
+agreement: the reader's text and provenance stay.
 An empty draft (such as the tail block a reader adds for output lost at a
 max_tokens cut) has nothing to proofread, so the reviewer is asked to
-transcribe its crop instead. The truncation marker is never shown to the
+transcribe its crop instead; "correct" then means there is nothing to
+transcribe, and an answer that is no transcription (a bare page number, a
+note such as "N/A") is rejected. An accepted tail is marked
+meta["tail_recovered"]. The truncation marker is never shown to the
 reviewer, and a proposal containing it is never accepted.
 
 Which blocks are reviewed is a policy: every block with a validator flag, plus
@@ -39,13 +44,30 @@ from PIL import Image
 from .backend import (TRUNCATION_MARKER, ChatClient, ServerError, Stopped, check_stop,
                       image_part, map_concurrent, text_part)
 from .schema import Block, Page
-from .validate import strip_math_delims, validate_block
+from .validate import outside_math, strip_math_delims, validate_block
 
 DEGENERATE = {"empty", "repetition", "truncated"}
 # check_latex runs KaTeX only on structurally sound LaTeX, so a draft with one
 # of these flags was never KaTeX-checked (see gate).
 _STRUCTURAL = {"latex_braces", "latex_env", "latex_leftright", "latex_delims"}
 _MARK = TRUNCATION_MARKER.strip()       # "<<TRUNCATED>>", with or without its newline
+# The Markdown escapes and HTML entities readers write into text (htmlmd),
+# each with the bare form that renders as markup instead. They are not in
+# the image, so a reviewer may drop them: a*b then renders as emphasis and
+# List<String> as an HTML tag. (Moving escaped text into math is no drop.)
+_ESCAPES = {r"\*": r"(?<!\\)\*", r"\_": r"(?<!\\)_", r"\`": r"(?<!\\)`",
+            "&lt;": r"<(?=[A-Za-z/!?])", "&amp;": r"&(?!amp;|lt;)(?=#?\w+;)",
+            r"\#": r"(?m)^ {0,3}#", r"\-": r"(?m)^ {0,3}-(?=\s|$)",
+            r"\+": r"(?m)^ {0,3}\+(?=\s|$)", r"\>": r"(?m)^ {0,3}>",
+            r"\.": r"(?m)^ {0,3}\d{1,9}\.(?=\s|$)"}
+# Answers to "transcribe this region" that are not a transcription: a bare
+# number (the page number at the foot of a tail crop), a placeholder, or a
+# one-line note about the crop. (Answers without a letter or digit are
+# caught too.)
+_PLACEHOLDER = re.compile(
+    r"[\W_]*(?:\d+|n/?a|none|empty|blank|nothing(?: else)?(?: to transcribe)?)[\W_]*"
+    r"|[(\[][^()\[\]\n]*\b(?:transcri\w*|nothing|blank|empty|illegible|page numbers?)\b"
+    r"[^()\[\]\n]*[)\]]", re.I)
 
 _COMMON_RULES = """Rules:
 - Transcribe only what is visible in the image. Never add, complete, or summarise.
@@ -81,6 +103,7 @@ The image shows one table. The OCR draft (HTML or Markdown) is:
 Check every cell, merged cells (colspan/rowspan), and any math (keep it as $...$).
 {rules}
 - Return an HTML <table> if the table has merged cells, otherwise HTML or Markdown as in the draft.
+- Keep the draft's Markdown escapes and HTML entities (&lt;, &amp;) exactly as they are.
 
 Answer in exactly this format:
 VERDICT: correct | fixed | unreadable
@@ -97,6 +120,8 @@ The image shows one region of a page. The OCR draft (Markdown, math as $...$) is
 Check the wording, punctuation, and especially every piece of inline math.
 {rules}
 - Keep Markdown, with inline math as $...$.
+- Keep the draft's Markdown escapes (\\*, \\_, \\$, \\#) and HTML entities (&lt;, &amp;)
+  exactly as they are: they are not in the image, but they make the text render as printed.
 
 Answer in exactly this format:
 VERDICT: correct | fixed | unreadable
@@ -114,12 +139,13 @@ Rules:
 - Transcribe only what is visible in the image. Never add, complete, or summarise.
 - Leave out running headers, footers, and page numbers.
 - {form}
-- If there is nothing else to transcribe, answer VERDICT: correct with nothing inside the tags.
+- Answer VERDICT: fixed with the transcription. If there is nothing else to transcribe,
+  answer VERDICT: correct with nothing inside the tags.
 
 Answer in exactly this format:
 VERDICT: fixed | correct | unreadable
 <{tag}>
-...
+(the transcription, or nothing)
 </{tag}>"""
 _TRANSCRIBE_KIND = {
     "formula": ("the display equation it shows",
@@ -143,6 +169,12 @@ def _draft(content: str) -> str:
     return content.replace(TRUNCATION_MARKER, "").replace(_MARK, "").strip()
 
 
+def _recheck(b: Block) -> None:
+    """KaTeX was down when the block was read (latex_unchecked): check it
+    again now, so its real flags decide whether and how it is reviewed."""
+    b.flags = sorted((set(b.flags) - {"latex_unchecked"}) | set(validate_block(b)))
+
+
 @dataclass
 class ReviewPolicy:
     review_types: set = field(default_factory=lambda: {"formula"})
@@ -152,17 +184,22 @@ class ReviewPolicy:
     pad: float = 0.01                 # crop padding as a fraction of the page
 
     def wants(self, b: Block) -> bool:
+        """Whether to review this block. A block flagged latex_unchecked is
+        re-checked first (its flags are updated in place): KaTeX may work now."""
         if b.type in ("figure", "header", "footer", "page_number"):
             return False
         if "page_failed" in b.flags:    # a failed page's placeholder: re-read, not reviewed
             return False
-        if b.meta.get("truncated_tail") and not b.bbox:
-            # The lost region of a box-less reader (markdown/olmocr) is unknown:
-            # a whole-page crop would re-transcribe what was kept. Leave it
-            # flagged for report.json instead.
+        if not b.bbox and not _draft(b.content):
+            # An empty block of a box-less reader (markdown/olmocr): its region
+            # is unknown, and from a whole-page crop the reviewer would
+            # re-transcribe what was kept (a truncated tail) or some other
+            # equation (an empty $$ $$). Leave it flagged for report.json.
             return False
-        # "latex_unchecked" alone is no reason to review: it says only that
-        # KaTeX was down when the block was read (_review_block re-checks).
+        if "latex_unchecked" in b.flags:
+            _recheck(b)
+        # A latex_unchecked that remains is no reason to review on its own:
+        # it says only that KaTeX is still down.
         flagged = bool(set(b.flags) - {"latex_unchecked"})
         return (self.flagged and flagged) or b.type in self.review_types
 
@@ -215,6 +252,33 @@ def change_fraction(a: str, b: str) -> float:
     return 1.0 - difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
+def same_text(a: str, b: str, kind: str) -> bool:
+    """Equal up to whitespace that does not matter: in LaTeX, all of it
+    except between two letters ("\\in S" is not "\\inS") and after a
+    backslash (a control space); in Markdown, all but the line structure
+    (list items, table rows, paragraphs)."""
+    def norm(s: str) -> str:
+        if kind == "formula":
+            return re.sub(r"(?<![A-Za-z\\]) |(?<!\\) (?![A-Za-z])", "", " ".join(s.split()))
+        lines = "\n".join(" ".join(ln.split()) for ln in s.strip().splitlines())
+        return re.sub(r"\n{3,}", "\n\n", lines)
+    return norm(a) == norm(b)
+
+
+def dropped_escapes(draft: str, proposal: str) -> list[str]:
+    """The draft's escapes that the proposal turned into markup: fewer of
+    the escape and more of its bare form, outside math."""
+    d, p = outside_math(draft), outside_math(proposal)
+    return [esc for esc, bare in _ESCAPES.items()
+            if p.count(esc) < d.count(esc)
+            and len(re.findall(bare, p)) > len(re.findall(bare, d))]
+
+
+def _placeholder(proposal: str) -> bool:
+    return (not re.search(r"[^\W_]", proposal)
+            or _PLACEHOLDER.fullmatch(proposal.strip()) is not None)
+
+
 def gate(block: Block, proposal: str, policy: ReviewPolicy) -> tuple[bool, str]:
     """Decide whether the reviewer's proposal replaces the block content."""
     if not proposal.strip():
@@ -232,11 +296,18 @@ def gate(block: Block, proposal: str, policy: ReviewPolicy) -> tuple[bool, str]:
     if added:
         return False, f"introduces flags {sorted(added)}"
     if old_flags & DEGENERATE:
+        if _placeholder(proposal):
+            return False, "not a transcription"
         return True, "draft degenerate; reviewer re-read accepted"
+    draft = _draft(block.content)
+    if prompt_kind(block.type) != "formula":
+        lost = dropped_escapes(draft, proposal)
+        if lost:
+            return False, f"drops Markdown escapes {lost}"
     # latex_unchecked says nothing against the draft: it keeps the tight bound
     limit = (policy.max_change_flagged if old_flags - {"latex_unchecked"}
              else policy.max_change)
-    frac = change_fraction(_draft(block.content), proposal)
+    frac = change_fraction(draft, proposal)
     if frac > limit:
         return False, f"change {frac:.2f} > limit {limit:.2f}"
     return True, f"change {frac:.2f}"
@@ -265,10 +336,9 @@ def review_block(client: ChatClient, page_img: Image.Image, block: Block,
 def _review_block(client: ChatClient, page_img: Image.Image, block: Block,
                   policy: ReviewPolicy, model_tag: str) -> Block:
     if "latex_unchecked" in block.flags:
-        # KaTeX was down when the block was read: check the draft now, so the
-        # reviewer is told its real problems and the gate compares against them.
-        block.flags = sorted((set(block.flags) - {"latex_unchecked"})
-                             | set(validate_block(block)))
+        # so the reviewer is told the draft's real problems, and the gate
+        # compares against them
+        _recheck(block)
     kind = prompt_kind(block.type)
     draft = _draft(block.content)
     if draft:
@@ -289,12 +359,20 @@ def _review_block(client: ChatClient, page_img: Image.Image, block: Block,
         block.flags = sorted(set(block.flags) | {"unreadable"})
         block.meta["reviewed"] = "unreadable"
         return block
-    # "correct" keeps a draft; for an empty draft a transcription still counts
-    if proposal is None or proposal == draft or (verdict == "correct" and draft):
-        record["decision"] = "kept (reviewer agreed)" if verdict == "correct" \
-            else "kept (no usable proposal)"
+    if proposal is None and verdict != "correct":
+        record["decision"] = "kept (no usable proposal)"
         block.history.append(record)
-        block.meta["reviewed"] = "agreed" if verdict == "correct" else "no-proposal"
+        block.meta["reviewed"] = "no-proposal"
+        return block
+    # "correct" keeps the draft whatever came with it (for an empty draft:
+    # there is nothing to transcribe), and so does a proposal equal to it.
+    if verdict == "correct" or same_text(draft, proposal, kind):
+        record["decision"] = ("kept (reviewer agreed)" if draft
+                              else "kept (reviewer: nothing to transcribe)")
+        if proposal and proposal != draft:
+            record["proposal"] = proposal
+        block.history.append(record)
+        block.meta["reviewed"] = "agreed"
         return block
 
     ok, why = gate(block, proposal, policy)
@@ -304,8 +382,10 @@ def _review_block(client: ChatClient, page_img: Image.Image, block: Block,
                               "previous_source": block.source})
         block.content = proposal
         block.source = model_tag
+        block.meta["reviewed"] = "edited"       # first: see validate_block
         block.flags = validate_block(block)
-        block.meta["reviewed"] = "edited"
+        if block.meta.get("truncated_tail"):
+            block.meta["tail_recovered"] = True
     else:
         block.history.append({**record, "decision": f"rejected: {why}",
                               "proposal": proposal})

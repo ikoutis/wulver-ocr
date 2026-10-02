@@ -64,11 +64,19 @@ class TestDots:
         assert srv.requests[0]["messages"][0]["content"][1]["text"].startswith(
             "<|img|><|imgpad|><|endofimg|>")
 
-    def test_read_truncated_marks_last_block(self):
+    def test_read_truncated_adds_tail_block(self):
+        # cut inside the Picture: the five complete elements are kept as they
+        # are (no marker on the intact formula); a tail block covers the rest
         s = json.dumps(ELEMENTS)
         srv = FakeServer(lambda p, n: (s[: s.index('"Picture"')], "length"))
         blocks = DotsReader(srv.client()).read(Image.new("RGB", (840, 1092)))
-        assert blocks[-1].content.endswith(TRUNCATION_MARKER)
+        assert [b.type for b in blocks] == ["header", "title", "heading", "text",
+                                           "formula", "text"]
+        assert blocks[4].content == "L = D - A"
+        assert not any(TRUNCATION_MARKER.strip() in b.content for b in blocks)
+        tail = blocks[-1]
+        assert tail.content == "" and tail.meta == {"truncated_tail": True}
+        assert tail.bbox == [0.0, 350 / 1092, 1.0, 1.0]
 
     def test_retry_uses_sampling(self):
         srv = FakeServer(lambda p, n: "[]")

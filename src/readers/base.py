@@ -5,7 +5,7 @@ import math
 from PIL import Image
 
 from ..backend import ChatClient
-from ..schema import Block
+from ..schema import DROPPED_TYPES, Block
 
 
 class Reader:
@@ -23,13 +23,40 @@ class Reader:
 
     def read(self, img: Image.Image, attempt: int = 0) -> list[Block]:
         """attempt > 0 is a retry after a degenerate (truncated) reading:
-        adapters should perturb decoding (see RETRY_SAMPLING)."""
+        adapters should perturb decoding (see RETRY_SAMPLING).
+
+        A reply that was cut off (backend.TRUNCATION_MARKER, or output that
+        ends inside an element) keeps its complete elements as they are and
+        ends with ``truncated_tail(...)``; the marker itself never goes into
+        a block."""
         raise NotImplementedError
 
 
 # Decoding for retries. Greedy decoding is what makes a loop self-sustaining;
 # a little temperature plus a mild repetition penalty usually breaks it.
 RETRY_SAMPLING = {"temperature": 0.3, "repetition_penalty": 1.05}
+
+TAIL_MIN_HEIGHT = 0.02      # page fraction: a tail box is never empty
+
+
+def truncated_tail(kept: list[Block], source: str) -> Block:
+    """The block standing for reader output lost at a cut: empty, marked
+    meta["truncated_tail"] (validation flags it, so the page is re-read, and
+    if it stays cut the reviewer transcribes the region from its crop).
+
+    Its box is the region the lost output most likely covers: the full width
+    from the bottom of the last kept element to the bottom of the page.
+    Running headers and footers are ignored (they sit at the page edges, not
+    in the reading flow), and with nothing kept it is the whole page. A reader
+    without boxes (Markdown) cannot say where the cut fell: then it has none."""
+    if kept and not any(b.bbox for b in kept):
+        bbox = None
+    else:
+        y0 = max((b.bbox[3] for b in kept if b.bbox and b.type not in DROPPED_TYPES),
+                 default=0.0)
+        bbox = [0.0, min(y0, 1.0 - TAIL_MIN_HEIGHT), 1.0, 1.0]
+    return Block(type="text", content="", bbox=bbox, source=source,
+                 meta={"truncated_tail": True})
 
 
 def smart_resize(height: int, width: int, factor: int = 28,

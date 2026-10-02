@@ -27,7 +27,7 @@ from PIL import Image
 from ..backend import TRUNCATION_MARKER, image_part, text_part
 from ..schema import Block
 from . import htmlmd
-from .base import Reader, truncated_tail
+from .base import Reader, drop_repeats, truncated_tail
 
 ALLOWED_TAGS = ["math", "br", "i", "b", "u", "del", "sup", "sub", "table", "tr", "td",
                 "p", "th", "div", "pre", "h1", "h2", "h3", "h4", "h5", "ul", "ol", "li",
@@ -90,8 +90,10 @@ LABEL_MAP = {
     "bibliography": "reference",
 }
 # An equation number written outside the math, with the punctuation around
-# it: (3) (2.1) (3a) (A.3) (2.1-a) (3') (ii) (b) (*) (†), [5], or a bare 2.1.
-_LABEL = r"(?:[A-Z]?\.?\d+(?:[.\-]\d+)*(?:[.\-]?[a-z])?|[ivx]+|[IVX]+|[a-zA-Z]|[*†‡§]{1,3})['′]*"
+# it: (3) (2.1) (3a) (A.3) (II.3) (2.1-a) (3') (ii) (b) (*) (†), [5], or a
+# bare 2.1.
+_LABEL = (r"(?:(?:[IVX]+|[A-Z])?\.?\d+(?:[.\-]\d+)*(?:[.\-]?[a-z])?|[ivx]+|[IVX]+|[a-zA-Z]"
+          r"|[*†‡§]{1,3})['′]*")
 _EQNUM = re.compile(rf"\s*[,.;:]?\s*(?:\(\s*({_LABEL})\s*\)|\[\s*({_LABEL})\s*\]"
                     rf"|(\d+(?:\.\d+)*)(?!\w|\.\d))\s*[,.;:]?\s*")
 
@@ -137,7 +139,8 @@ def _wrapped(div: htmlmd.Node, children: list) -> htmlmd.Node:
 
 
 def _has_content(pieces: list) -> bool:
-    return any(not isinstance(p, str) or p.strip() for p in pieces)
+    """Any text, or any element but a line break."""
+    return any(p.tag != "br" if isinstance(p, htmlmd.Node) else p.strip() for p in pieces)
 
 
 def _split(node: htmlmd.Node, pred) -> list:
@@ -197,18 +200,22 @@ def _add_tag(b: Block, number: str) -> None:
 
 def _formula_blocks(div: htmlmd.Node, bbox, tag, meta) -> list[Block]:
     """An Equation-Block: each display formula becomes a formula block, an
-    equation number written after it (outside the math) becomes its \\tag,
+    equation number written beside it (outside the math) becomes its \\tag,
     and any other text stays, in order, as text blocks with the same box.
-    Inline <math> belongs to that text, unless the block has no display math
-    at all (then every <math> is an equation)."""
+    The numbers are on the left (amsart's leqno) if the block starts with
+    one, else on the right. Inline <math> belongs to that text, unless the
+    block has no display math at all (then every <math> is an equation)."""
     maths = div.find_all("math")
     if not maths:
         return [Block(type="text", content=htmlmd.to_markdown(div), bbox=bbox,
                       source=tag, meta=meta)]
     display = any(htmlmd.is_display(m) for m in maths)
+    segs = _split(div, htmlmd.is_display if display else lambda n: n.tag == "math")
+    first = _leading_number(segs[0]) if not isinstance(segs[0], htmlmd.Node) else (None, [])
+    left = bool(first[0]) and not _has_content(first[1])
     out: list[Block] = []
     number = None                       # a number written before its equation
-    for seg in _split(div, htmlmd.is_display if display else lambda n: n.tag == "math"):
+    for seg in segs:
         if isinstance(seg, htmlmd.Node):
             out.append(Block(type="formula", content=seg.text().strip(), bbox=bbox,
                              source=tag, meta=dict(meta)))
@@ -217,7 +224,7 @@ def _formula_blocks(div: htmlmd.Node, bbox, tag, meta) -> list[Block]:
                 number = None
             continue
         found, rest = _leading_number(seg)
-        if found and out and out[-1].type == "formula":
+        if found and out and out[-1].type == "formula" and not left:
             _add_tag(out[-1], found)
             seg = rest
         elif found and not _has_content(rest):
@@ -227,6 +234,8 @@ def _formula_blocks(div: htmlmd.Node, bbox, tag, meta) -> list[Block]:
         if text.strip(" \n,.;:"):       # more than the sentence's punctuation
             out.append(Block(type="text", content=text, bbox=bbox, source=tag,
                              meta=dict(meta)))
+    if number and out and out[-1].type == "formula":
+        _add_tag(out[-1], number)       # a number after the last equation
     return out
 
 
@@ -300,10 +309,9 @@ def _leaf_blocks(div: htmlmd.Node, label: str, bbox, tag: str) -> list[Block]:
             return [block("title", content)]
         # <h2> is a top-level section, '##' (as dots' levels and design.md)
         return [block("heading", content, **({"level": int(h.tag[1]) - 1} if h else {}))]
-    content = htmlmd.to_markdown(div)
     if btype == "caption":      # one line: a <br> is a space
-        content = re.sub(r"(?<!\n)\n(?!\n)", " ", content)
-    return [block(btype, content)]
+        return [block(btype, re.sub(r"(?<!\n)\n(?!\n)", " ", htmlmd.to_markdown(div, br=" ")))]
+    return [block(btype, htmlmd.to_markdown(div))]
 
 
 def _layout_root(root: htmlmd.Node) -> htmlmd.Node:
@@ -317,36 +325,60 @@ def _layout_root(root: htmlmd.Node) -> htmlmd.Node:
     return root
 
 
+def _is_div(c) -> bool:
+    return isinstance(c, htmlmd.Node) and c.tag == "div"
+
+
 def html_to_blocks(html_text: str, tag: str, truncated: bool = False) -> list[Block]:
     """Chandra's HTML -> blocks. Content outside every layout div is kept, as
     a text block without a box. ``truncated``: the reply was cut off; the
-    element in progress at the cut is dropped and a truncated_tail block
-    stands for everything lost. A reply that yields no block at all (and no
-    Blank-Page) is treated the same way."""
+    element in progress at the cut is dropped and truncated_tail blocks stand
+    for everything lost, from that element's data-bbox on. A reply that
+    yields no block at all (and no Blank-Page) is treated the same way. A
+    layout div the model repeated (same box, or the same label and text over
+    and over) is kept once, its blocks marked meta["repeated"]."""
     root = _layout_root(htmlmd.parse(html_text))
     items = list(root.children)
     last = next((k for k in reversed(range(len(items))) if _has_content([items[k]])), None)
+    cut = None
     if truncated and last is not None and (
             isinstance(items[last], str) or not items[last].complete):
+        if _is_div(items[last]):
+            cut = parse_bbox(items[last].attrs.get("data-bbox", ""))
         del items[last:]                # the element in progress at the cut
+    kept = drop_repeats(items, lambda c: _is_div(c) and _box_key(c),
+                        lambda c: _is_div(c) and _text_key(c))
     blocks: list[Block] = []
     loose: list = []
-    for c in items + [None]:
-        if c is None or (isinstance(c, htmlmd.Node) and c.tag == "div"):
+    for c, copies in kept + [[None, 1]]:
+        if c is None or _is_div(c):
             text = htmlmd.to_markdown(_wrapped(root, loose)) if _has_content(loose) else ""
             if text:
                 blocks.append(Block(type="text", content=text, source=tag,
                                     meta={"category": None}))
             loose = []
             if c is not None:
-                blocks.extend(_div_blocks(c, tag))
+                new = _div_blocks(c, tag)
+                for b in new if copies > 1 else ():
+                    b.meta["repeated"] = copies
+                blocks.extend(new)
         else:
             loose.append(c)
     blank = any(isinstance(c, htmlmd.Node) and c.attrs.get("data-label") == "Blank-Page"
                 for c in items)
     if truncated or not (blocks or blank):
-        blocks.append(truncated_tail(blocks, tag))
+        blocks.extend(truncated_tail(blocks, tag, cut))
     return blocks
+
+
+def _box_key(div: htmlmd.Node):
+    box = parse_bbox(div.attrs.get("data-bbox", ""))
+    return tuple(box) if box else None
+
+
+def _text_key(div: htmlmd.Node):
+    text = " ".join(div.text().split())
+    return (div.attrs.get("data-label"), text) if text else None
 
 
 class ChandraReader(Reader):

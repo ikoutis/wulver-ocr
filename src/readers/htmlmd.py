@@ -20,9 +20,15 @@ escapes * and _): $ * _ ` get a backslash, a '<' that could open a tag and an
 '&' that could start an entity are HTML-escaped, and a line that would begin
 a heading, list, or quote gets a backslash at its start.
 
-Parsing uses html.parser plus HTML's optional end tags for <p> and <li>; it
-tolerates the unclosed tags models produce, and caps nesting depth so that a
-looping reply cannot make the tree deep enough to overflow the recursion.
+A <br> in a paragraph or list item is a hard line break (a backslash at the
+end of the line), as in Chandra's own Markdown; in a heading it is a space.
+An ordered list keeps its start number, and a lettered or roman one
+(type="a", "i", …) writes its labels, "(a)", "(ii)", into its items.
+
+Parsing uses html.parser plus HTML's optional end tags for <p>, <li>, and
+table cells and rows; it tolerates the unclosed tags models produce, and caps
+nesting depth so that a looping reply cannot make the tree deep enough to
+overflow the recursion.
 """
 
 from __future__ import annotations
@@ -41,6 +47,10 @@ BLOCK_TAGS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "table
 _CLOSES_P = (BLOCK_TAGS - {"caption"}) | {"li", "blockquote"}
 _P_SCOPE = {"div", "li", "td", "th", "caption", "table"}
 _LI_SCOPE = {"ul", "ol"} | (_P_SCOPE - {"li"})
+# A new cell ends the open cell of its row, a new row the open row of its
+# table (HTML's implied </td> </th> </tr>).
+_ROW_SCOPE = {"table", "thead", "tbody", "tfoot"}
+_CELL_SCOPE = _ROW_SCOPE | {"tr"}
 # Deeper than this is a repetition loop, not a layout: further start tags are
 # kept but not nested, so every traversal below stays shallow.
 MAX_DEPTH = 100
@@ -100,6 +110,11 @@ class _TreeBuilder(HTMLParser):
             self._close_implied("p", _P_SCOPE)
         if tag == "li":     # <li>a<li>b: the second item ends the first
             self._close_implied("li", _LI_SCOPE)
+        if tag in ("td", "th", "tr"):
+            self._close_implied("td", _CELL_SCOPE)
+            self._close_implied("th", _CELL_SCOPE)
+        if tag == "tr":
+            self._close_implied("tr", _ROW_SCOPE)
         node = Node(tag, {k: (v if v is not None else "") for k, v in attrs})
         self.stack[-1].children.append(node)
         if push and tag not in VOID and len(self.stack) < MAX_DEPTH:
@@ -188,15 +203,21 @@ def _escape_block_starts(s: str) -> str:
 
 # ------------------------------------------------------------------ inline
 
+# inline() marks a <br> with _BR; a paragraph turns it into HARD_BREAK (a
+# backslash at the end of the line), a heading into a space.
+_BR = "\ue000"
+HARD_BREAK = "\\\n"
+_SPACE = " \t\n\r\f\v" + _BR
+
 
 def _wrap(inner: str, delim: str) -> str:
     """Emphasis delimiters go inside the element's surrounding whitespace:
     '<b>Proof. </b>By' is '**Proof.** By', not '**Proof.**By'."""
-    core = inner.strip()
+    core = inner.strip(_SPACE)
     if not core:
         return inner
-    lead = inner[:len(inner) - len(inner.lstrip())]
-    trail = inner[len(inner.rstrip()):]
+    lead = inner[:len(inner) - len(inner.lstrip(_SPACE))]
+    trail = inner[len(inner.rstrip(_SPACE)):]
     return f"{lead}{delim}{core}{delim}{trail}"
 
 
@@ -210,7 +231,7 @@ def inline(node: Union[Node, str], pre: bool = False) -> str:
         tex = " ".join(node.text().split())     # a newline inside $…$ could start a list
         return f"${tex}$" if tex else ""
     if t == "br":
-        return "\n"
+        return _BR
     if t == "img":      # outside a figure block an <img> is a hallucination
         return ""       # (Chandra's own parser deletes these)
     if t == "input":
@@ -235,7 +256,7 @@ def inline(node: Union[Node, str], pre: bool = False) -> str:
 
 def one_line(node: Node) -> str:
     """Inline Markdown on one line (headings): a <br> becomes a space."""
-    return _squash(inline(node).replace("\n", " "))
+    return _squash(inline(node).replace(_BR, " ").replace("\n", " "))
 
 
 # ------------------------------------------------------------------- block
@@ -272,19 +293,54 @@ def table_html(node: Node) -> str:
     return ser(node)
 
 
-def _list(node: Node, depth: int = 0) -> str:
-    lines, k = [], 0
+_LETTERED = ("a", "A", "i", "I")
+_ROMAN = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+          (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))
+
+
+def _count(v, default: int) -> int:
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ol_label(k: int, kind: str) -> str:
+    """Item k's label in an <ol type=kind>: a, b, …, aa / i, ii, … / A / I."""
+    label = ""
+    if kind in "iI":
+        for value, numeral in _ROMAN:
+            n, k = divmod(k, value)
+            label += numeral * n
+    else:
+        while k > 0:
+            k, r = divmod(k - 1, 26)
+            label = chr(ord("a") + r) + label
+    return label.upper() if kind in "AI" else label
+
+
+def _list(node: Node, depth: int = 0, br: str = HARD_BREAK) -> str:
+    """An ordered list is numbered from its start (or an item's value).
+    Markdown has no lettered lists: the items of one get a bullet and their
+    label, '- (a) …', unless they already start with it."""
+    kind = node.attrs.get("type", "") if node.tag == "ol" else None
+    lines, k = [], _count(node.attrs.get("start"), 1) - 1
     for c in node.children:
         if isinstance(c, Node) and c.tag == "li":
-            k += 1
-            marker = f"{k}." if node.tag == "ol" else "-"
+            k = _count(c.attrs.get("value"), k + 1)
             text_parts, nested = [], []
             for cc in c.children:
                 if isinstance(cc, Node) and cc.tag in ("ul", "ol"):
-                    nested.append(_list(cc, depth + 1))
+                    nested.append(_list(cc, depth + 1, br))
                 else:
                     text_parts.append(inline(cc))
-            lines.append("  " * depth + f"{marker} " + _paragraph("".join(text_parts)))
+            text = _paragraph("".join(text_parts), br)
+            if kind in _LETTERED and k > 0:
+                label = _ol_label(k, kind)
+                if not re.match(rf"\(?{re.escape(label)}[.)]", text, re.I):
+                    text = f"({label}) {text}"
+            marker = f"{k}." if kind is not None and kind not in _LETTERED else "-"
+            lines.append("  " * depth + f"{marker} " + text)
             lines.extend(nested)
     return "\n".join(lines)
 
@@ -295,18 +351,24 @@ def _squash(s: str) -> str:
     return s.strip()
 
 
-def _paragraph(s: str) -> str:
-    return _escape_block_starts(_squash(s))
+def _paragraph(s: str, br: str = HARD_BREAK) -> str:
+    """Inline Markdown as one escaped paragraph. A run of <br>s becomes
+    ``br`` (default: a hard line break), except where a line already ends:
+    there, and at the ends, a backslash would render literally."""
+    s = re.sub(rf"[ \t]*{_BR}[ \t{_BR}]*", _BR, _squash(s))
+    s = re.sub(rf"{_BR}(?=\n|$)|(?:^|(?<=\n)){_BR}", "", s)
+    return _escape_block_starts(s.replace(_BR, br))
 
 
-def to_markdown(node: Node) -> str:
-    """Block-level conversion of a node's children to Markdown."""
+def to_markdown(node: Node, br: str = HARD_BREAK) -> str:
+    """Block-level conversion of a node's children to Markdown. ``br``: what
+    a <br> becomes inside a paragraph (default: a hard line break)."""
     out: list[str] = []
     buf: list[str] = []
 
     def flush():
         if buf:
-            s = _paragraph("".join(buf))
+            s = _paragraph("".join(buf), br)
             if s:
                 out.append(s)
             buf.clear()
@@ -318,7 +380,7 @@ def to_markdown(node: Node) -> str:
             if t in ("h1", "h2", "h3", "h4", "h5", "h6"):
                 out.append("#" * int(t[1]) + " " + one_line(c))
             elif t in ("ul", "ol"):
-                out.append(_list(c))
+                out.append(_list(c, 0, br))
             elif t == "table":
                 out.append(table_html(c))
             elif t == "pre":
@@ -328,9 +390,9 @@ def to_markdown(node: Node) -> str:
             elif is_display(c):
                 out.append(f"$$\n{c.text().strip()}\n$$")
             else:   # p, div, caption
-                out.append(to_markdown(c) if any(
+                out.append(to_markdown(c, br) if any(
                     isinstance(x, Node) and (x.tag in BLOCK_TAGS or is_display(x))
-                    for x in c.children) else _paragraph(inline(c)))
+                    for x in c.children) else _paragraph(inline(c), br))
         else:
             buf.append(inline(c))
     flush()

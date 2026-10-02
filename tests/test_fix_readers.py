@@ -101,7 +101,7 @@ class TestInlineConversion:
         ("<p># of vertices</p>", r"\# of vertices"),
         ("<p>2016. The year</p>", r"2016\. The year"),
         ("<p>- a</p><p>+ b</p><p>&gt; c</p><p>---</p>", "\\- a\n\n\\+ b\n\n\\> c\n\n\\---"),
-        ("<p>line<br>- not a list</p>", "line\n\\- not a list"),
+        ("<p>line<br>- not a list</p>", "line\\\n\\- not a list"),    # v2-readers-10
         ("<p>-1 and +2 and x-y</p>", "-1 and +2 and x-y"),
         ("<ul><li># one</li></ul>", r"- \# one"),
     ])
@@ -187,7 +187,8 @@ class TestChandraBlocks:
                 '</p><p>1: <b>for</b> <math>i = 1</math> to <math>n</math> <b>do</b><br>'
                 '2: <math>M \\gets M \\cup \\{e_i\\}</math><br>3: <b>end for</b></p></div>')
         assert chandra(algo) == [("text", "**Algorithm 1** Greedy\n\n1: **for** $i = 1$ to $n$ "
-                                          "**do**\n2: $M \\gets M \\cup \\{e_i\\}$\n3: **end for**")]
+                                          "**do**\\\n2: $M \\gets M \\cup \\{e_i\\}$\\\n"
+                                          "3: **end for**")]     # hard breaks: v2-readers-10
         assert chandra('<div data-label="Code-Block" data-bbox="1 1 900 900"><p>Listing 1</p>'
                        '<pre>def f(x):\n    return x</pre><pre>print(f(1))</pre></div>') == [
             ("text", "Listing 1"), ("code", "def f(x):\n    return x"), ("code", "print(f(1))")]
@@ -318,13 +319,13 @@ class TestTruncatedTail:
                 Block(type="text", content="a", bbox=[0.1, 0.1, 0.5, 0.3]),
                 Block(type="text", content="b", bbox=[0.5, 0.1, 0.9, 0.4]),
                 Block(type="text", content="c")]
-        tail = truncated_tail(kept, "src")
+        (tail,) = truncated_tail(kept, "src")
         assert (tail.type, tail.content, tail.source) == ("text", "", "src")
         assert tail.bbox == [0.0, 0.4, 1.0, 1.0] and tail.meta == {"truncated_tail": True}
-        assert truncated_tail([], "s").bbox == [0.0, 0.0, 1.0, 1.0]
-        assert truncated_tail([Block(type="text", content="x")], "s").bbox is None
-        assert truncated_tail([Block(type="text", content="x", bbox=[0, 0.5, 1, 1.0])],
-                              "s").bbox == [0.0, 0.98, 1.0, 1.0]
+        assert [t.bbox for t in truncated_tail([], "s")] == [[0.0, 0.0, 1.0, 1.0]]
+        assert [t.bbox for t in truncated_tail([Block(type="text", content="x")], "s")] == [None]
+        assert [t.bbox for t in truncated_tail(
+            [Block(type="text", content="x", bbox=[0, 0.5, 1, 1.0])], "s")] == [[0.0, 0.98, 1.0, 1.0]]
 
     def test_dots_looping_element(self):
         els = [{"bbox": [50, 50, 800, 150], "category": "Section-header", "text": "## 1 Intro"},
@@ -336,8 +337,8 @@ class TestTruncatedTail:
         assert [(b.type, b.content) for b in blocks] == [
             ("heading", "1 Intro"), ("formula", "E = mc^{2}"), ("text", "")]
         assert blocks[-1].meta == {"truncated_tail": True}
-        # the tail covers the looping element's region (y 310-700 of 1092)
-        assert blocks[-1].bbox == [0.0, 300 / 1092, 1.0, 1.0]
+        # the tail starts at the looping element's own box (y 310-700 of 1092)
+        assert blocks[-1].bbox == [0.0, 310 / 1092, 1.0, 1.0]
 
     def test_dots_cut_between_elements(self):
         s = json.dumps(TestDotsJson.E)
@@ -351,7 +352,7 @@ class TestTruncatedTail:
             '<div data-label="Text" data-bbox="100 310 900 700"><p>the the the', "length"))
         blocks = ChandraReader(srv.client()).read(Image.new("RGB", (1700, 2200)))
         assert [(b.type, b.content) for b in blocks] == [("text", "Done."), ("text", "")]
-        assert blocks[-1].bbox == [0.0, 0.3, 1.0, 1.0] and blocks[-1].meta["truncated_tail"]
+        assert blocks[-1].bbox == [0.0, 0.31, 1.0, 1.0] and blocks[-1].meta["truncated_tail"]
 
     def test_chandra_cut_between_divs(self):
         srv = FakeServer(lambda p, n: (
@@ -360,7 +361,7 @@ class TestTruncatedTail:
         assert [(b.type, b.content) for b in blocks] == [("text", "Done."), ("text", "")]
 
     @pytest.mark.parametrize("reply, kept", [
-        ("# Title\n\nSome text.\n\n", [("heading", "Title"), ("text", "Some text.")]),
+        ("# Title\n\nSome text.\n\n", [("title", "Title"), ("text", "Some text.")]),
         ("Para one.\n\n$$\nx = 1\n$$\n", [("text", "Para one."), ("formula", "x = 1")]),
         ("Para one.\n\n<table><tr><td>a</td></tr></table>\n",
          [("text", "Para one."), ("table", "<table><tr><td>a</td></tr></table>")]),
@@ -415,7 +416,7 @@ def test_read_stage_saves_tail_block(tmp_path, pdf_path, monkeypatch):
 class TestMarkdownReader:
     def test_outer_fence_is_stripped(self):
         """readers-15"""
-        reply = ("```markdown\n# 1 Introduction\n\nLet $G$ be a graph.\n\n$$\nL = D - A \\tag{1}"
+        reply = ("```markdown\n## 1 Introduction\n\nLet $G$ be a graph.\n\n$$\nL = D - A \\tag{1}"
                  "\n$$\n\nMore text.\n```")
         assert [(b.type, b.content) for b in split_markdown(strip_outer_fence(reply))] == [
             ("heading", "1 Introduction"), ("text", "Let $G$ be a graph."),
@@ -429,7 +430,7 @@ class TestMarkdownReader:
         """readers-15"""
         srv = FakeServer(lambda p, n: "```markdown\n# T\n\nBody.\n```")
         blocks = PageMarkdownReader(srv.client()).read(Image.new("RGB", (800, 1000)))
-        assert [(b.type, b.content) for b in blocks] == [("heading", "T"), ("text", "Body.")]
+        assert [(b.type, b.content) for b in blocks] == [("title", "T"), ("text", "Body.")]
 
     def test_escaped_citations_are_not_display_math(self):
         """readers-19"""
@@ -489,7 +490,7 @@ class TestOlmOCR:
         r = OlmOCRReader(srv.client())
         blocks = r.read(Image.new("RGB", (850, 1100)))
         assert [(b.type, b.content) for b in blocks] == [
-            ("heading", "A Title"), ("text", "Let $G=(V,E)$ be a graph and $x$ a vector."),
+            ("title", "A Title"), ("text", "Let $G=(V,E)$ be a graph and $x$ a vector."),
             ("formula", "L = D - A"), ("figure", "")]
         assert blocks[3].meta["reader_description"] == "A path graph on four vertices"
         body = srv.requests[0]

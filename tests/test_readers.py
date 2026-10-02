@@ -66,7 +66,8 @@ class TestDots:
 
     def test_read_truncated_adds_tail_block(self):
         # cut inside the Picture: the five complete elements are kept as they
-        # are (no marker on the intact formula); a tail block covers the rest
+        # are (no marker on the intact formula); a tail block covers the rest,
+        # from the Picture's own box on
         s = json.dumps(ELEMENTS)
         srv = FakeServer(lambda p, n: (s[: s.index('"Picture"')], "length"))
         blocks = DotsReader(srv.client()).read(Image.new("RGB", (840, 1092)))
@@ -76,7 +77,7 @@ class TestDots:
         assert not any(TRUNCATION_MARKER.strip() in b.content for b in blocks)
         tail = blocks[-1]
         assert tail.content == "" and tail.meta == {"truncated_tail": True}
-        assert tail.bbox == [0.0, 350 / 1092, 1.0, 1.0]
+        assert tail.bbox == [0.0, 400 / 1092, 1.0, 1.0]
 
     def test_retry_uses_sampling(self):
         srv = FakeServer(lambda p, n: "[]")
@@ -124,7 +125,7 @@ class TestMarkdownReader:
     def test_split(self):
         body, _ = strip_front_matter(PAGE_MD)
         blocks = split_markdown(body)
-        assert [b.type for b in blocks] == ["heading", "text", "formula", "table",
+        assert [b.type for b in blocks] == ["title", "text", "formula", "table",
                                            "table", "list", "figure"]
         assert blocks[2].content == r"\sum_{i} a_i = 1 \tag{1}"
         assert "</table>" in blocks[3].content       # spans the blank line

@@ -25,23 +25,45 @@
 #
 # Login nodes have no GPU (cuda=False below is expected) and cap memory at
 # 20 GB per user; if the vLLM install is killed there, run this script inside
-# an interactive CPU session instead. Verify on a GPU (debug QOS, free):
+# an interactive CPU session instead. Then verify on a GPU (debug QOS, free);
+# --gpu-check only runs nvidia-smi and the torch/vLLM check in the env:
 #     srun --account=ikoutis --qos=debug --partition=debug_gpu \
-#          --gres=gpu:a100_10g:1 --time=00:10:00 \
-#          bash -lc 'module load Miniforge3 && source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate "${WOCR_CONDA_ENV:-/project/ikoutis/conda_env/wocr}" && nvidia-smi && python -c "import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"'
+#          --gres=gpu:a100_10g:1 --time=00:10:00 bash -l tools/setup_env.sh --gpu-check
 # If torch reports cuda=False on the GPU node, the wheel's CUDA is newer than
 # the node driver (nvidia-smi prints the max CUDA it supports): reinstall with
 # a matching wheel, e.g. WOCR_VLLM_SPEC="vllm==<older>" or the cu12x variant.
+#
+# The script activates the env only for itself. In your own shell, before
+# tools/stage_models.py, pytest, or anything else that needs the env, run:
+#     module load Miniforge3 && source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate /project/ikoutis/conda_env/wocr
 # =============================================================================
 set -euo pipefail
+cd "$(dirname "$0")/.."             # requirements.txt, src/ and logs/ are in the repo root
 
 ENV_PREFIX="${WOCR_CONDA_ENV:-/project/ikoutis/conda_env/wocr}"
 VLLM_SPEC="${WOCR_VLLM_SPEC:-vllm}"
 TORCH_BACKEND="${WOCR_TORCH_BACKEND:-cu129}"
-mkdir -p "$(dirname "$ENV_PREFIX")"
+ACTIVATE="module load Miniforge3 && source \"\$(conda info --base)/etc/profile.d/conda.sh\" && conda activate $ENV_PREFIX"
 
 module load Miniforge3
 source "$(conda info --base)/etc/profile.d/conda.sh"
+
+if [ "${1:-}" = --gpu-check ]; then
+    set +u
+    conda activate "$ENV_PREFIX"
+    set -u
+    nvidia-smi || echo "[!] nvidia-smi failed: no GPU or no driver on this node"
+    python - <<'EOF'
+import torch, vllm
+ok = torch.cuda.is_available()      # first: get_device_name() raises when CUDA is unusable
+print(f"torch {torch.__version__} (CUDA {torch.version.cuda}) | vllm {vllm.__version__} "
+      f"| cuda={ok}" + (f" | {torch.cuda.get_device_name(0)}" if ok else ""))
+EOF
+    exit 0
+fi
+
+mkdir -p "$(dirname "$ENV_PREFIX")"
+mkdir -p logs                       # sbatch's --output dir (tracked; a copy may lack it)
 
 if [ -d "$ENV_PREFIX" ]; then
     echo "[*] env already exists at $ENV_PREFIX — updating packages in place"
@@ -82,6 +104,10 @@ EOF
 
 echo
 echo "[*] done; package versions saved to $ENV_PREFIX/wocr.lock.txt. Next:"
+echo "    activate the env in your own shell (this script's activation ended with it):"
+echo "      $ACTIVATE"
+echo "      srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1 \\"
+echo "           --time=00:10:00 bash -l tools/setup_env.sh --gpu-check   # GPU check (free)"
 echo "      python tools/stage_models.py --profile default     # download weights (~65 GB)"
 echo "      pytest tests/                                     # CPU-only, seconds"
 echo "    then e.g.: INPUTS=<dir of PDFs> sbatch --array=0-3 slurm/ocr.sbatch"

@@ -8,8 +8,11 @@ work/
 out/
 *.pdf
 
-# SLURM stdout/stderr and vLLM server logs
-logs/
+# SLURM stdout/stderr and vLLM server logs. The directory itself is tracked
+# (logs/.gitkeep): SLURM opens --output=logs/... before the script runs and
+# does not create missing directories, so a fresh clone needs it.
+logs/*
+!logs/.gitkeep
 
 # local model snapshots, if anyone stages into the repo by mistake
 models/

@@ -47,6 +47,10 @@ them in the pipeline itself:
    this took three round trips because `serve_lib.sh` reported only the last 40 lines of the
    server log, all of them the API server's traceback; the engine's root cause was 180 lines
    up. The report now shows the log's error lines first, then the tail.
+5. **The executable bit.** `git pull` on Wulver kept refusing with "local changes" to
+   `tools/setup_env.sh`, the one tracked file with the executable bit: `/project` drops the bit,
+   so every checkout left a mode change behind. The file is now tracked without the bit (it is
+   always run as `bash tools/setup_env.sh`), and that clone has `core.fileMode false`.
 
 The smoke run is resubmitted with the fixes. Its inputs are the two public samples now in
 `samples/` (a born-digital IEEE paper with numbered equations; a 19th-century book scan) and a

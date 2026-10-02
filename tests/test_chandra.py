@@ -39,7 +39,8 @@ class TestHtmlToBlocks:
         assert self.blocks[3].content.endswith(r"(x_u - x_v)^2 \tag{3}")
 
     def test_heading_level(self):
-        assert self.blocks[1].meta["level"] == 2 and self.blocks[1].content == "2 Spectral sparsifiers"
+        # <h2> is a top-level section: level 1, rendered '##' (as dots)
+        assert self.blocks[1].meta["level"] == 1 and self.blocks[1].content == "2 Spectral sparsifiers"
 
     def test_figure_keeps_reader_description(self):
         f = self.blocks[4]
@@ -96,10 +97,15 @@ class TestChandraReader:
         assert srv.requests[1]["top_p"] == 0.95
 
     def test_truncation(self):
+        # cut inside the Equation-Block: the three complete divs are kept as
+        # they are, the cut one is dropped, and a tail block covers the rest
         srv = FakeServer(lambda p, n: (PAGE_HTML[:400], "length"))
         blocks = ChandraReader(srv.client()).read(Image.new("RGB", (1700, 2200)))
-        assert blocks[-1].content.endswith(TRUNCATION_MARKER)
-        assert "truncated" in validate_block(blocks[-1])
+        assert [b.type for b in blocks] == ["header", "heading", "text", "text"]
+        assert not any(TRUNCATION_MARKER.strip() in b.content for b in blocks)
+        tail = blocks[-1]
+        assert tail.meta == {"truncated_tail": True} and tail.content == ""
+        assert tail.bbox == [0.0, 0.26, 1.0, 1.0]
 
 
 class TestBackendExtras:

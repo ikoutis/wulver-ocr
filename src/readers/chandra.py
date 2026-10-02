@@ -336,7 +336,8 @@ def html_to_blocks(html_text: str, tag: str, truncated: bool = False) -> list[Bl
     for everything lost, from that element's data-bbox on. A reply that
     yields no block at all (and no Blank-Page) is treated the same way. A
     layout div the model repeated (same box, or the same label and text over
-    and over) is kept once, its blocks marked meta["repeated"]."""
+    and over) is kept once, its first block marked meta["repeated"] (one
+    mark per repeated element, however many blocks the div makes)."""
     root = _layout_root(htmlmd.parse(html_text))
     items = list(root.children)
     last = next((k for k in reversed(range(len(items))) if _has_content([items[k]])), None)
@@ -359,8 +360,8 @@ def html_to_blocks(html_text: str, tag: str, truncated: bool = False) -> list[Bl
             loose = []
             if c is not None:
                 new = _div_blocks(c, tag)
-                for b in new if copies > 1 else ():
-                    b.meta["repeated"] = copies
+                for b in new[:1] if copies > 1 else ():
+                    b.meta["repeated"] = copies     # once per element, as dots
                 blocks.extend(new)
         else:
             loose.append(c)

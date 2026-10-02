@@ -195,10 +195,13 @@ OLMOCR_TEMPERATURES = (0.1, 0.1, 0.2, 0.3, 0.5, 0.8, 0.9, 1.0)
 # Inline math \( … \), within one paragraph.
 _INLINE_PARENS = re.compile(r"\\\(\s*(\S(?:(?!\\\(|\n\s*\n).)*?)\s*\\\)", re.S)
 # Display math \[ … \] (olmOCR was trained on text whose $$ … $$ became this,
-# wherever it stood), and what a Markdown-escaped citation holds instead:
-# \[1\], \[1, 2\], \[Spi04\].
-_DISPLAY_BRACKETS = re.compile(r"\\\[((?:(?!\\\[).)*?)\\\]", re.S)
-_CITATION = re.compile(r"[\w\s,.;:'&\-–]+")
+# wherever it stood). The '\[' of a LaTeX row break with spacing (\\[4pt])
+# opens nothing.
+_DISPLAY_BRACKETS = re.compile(r"(?<!\\)\\\[((?:(?!(?<!\\)\\\[).)*?)\\\]", re.S)
+# What only math holds: a command, a script, a relation, a group. A
+# Markdown-escaped citation (\[1, 2\], \[Spi04\], \[ABC+20\], \[3, §2\],
+# \[Spi04, Thm. 2(b)\]) or interval (\[−1, 1\]) holds none of these.
+_MATHY = re.compile(r"\\[A-Za-z]|[\^_=<>{}|]")
 _TABLE = re.compile(r"(<table\b.*?</table>)", re.S | re.I)
 _TURN = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
          270: Image.Transpose.ROTATE_270}
@@ -206,14 +209,16 @@ _TURN = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
 
 def _lift_display(md: str) -> str:
     """Display math \\[ … \\] sharing a line with text -> $$ lines of its own,
-    so that split_markdown makes it a formula block (outside tables)."""
+    so that split_markdown makes it a formula block (outside tables). Only
+    brackets around math: a citation in Markdown-escaped brackets stays
+    text."""
     def lift(part: str) -> str:
         def sub(m: re.Match) -> str:
             before = part[part.rfind("\n", 0, m.start()) + 1:m.start()]
             end = part.find("\n", m.end())
             after = part[m.end():end if end >= 0 else len(part)]
-            if not (before.strip() or after.strip()) or _CITATION.fullmatch(m.group(1)):
-                return m.group(0)       # on lines of its own already, or a citation
+            if not (before.strip() or after.strip()) or not _MATHY.search(m.group(1)):
+                return m.group(0)       # on lines of its own already, or not math
             return f"\n$$\n{m.group(1).strip()}\n$$\n"
         return _DISPLAY_BRACKETS.sub(sub, part)
     return "".join(p if k % 2 else lift(p) for k, p in enumerate(_TABLE.split(md)))

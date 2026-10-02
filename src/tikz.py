@@ -17,13 +17,16 @@ for one canonical subset:
 ``parse_graph`` reads that subset back into vertices and edges, along with
 the common variants models write instead: chained paths ``(a) -- (b) -- (c)``,
 ``edge`` operations (and the automata self-loop ``edge[loop above] ()``),
-labels after the target, node options in any order, any arrow spec (``<-``,
-``latex-latex``, ``-{Stealth[length=2mm]}``), arrows set for the whole
-picture or a scope, ``\\tikzset``/``\\tikzstyle`` settings, and comments.
+labels after the target, node options in any order, a vertex label given as
+``label=above:$v_1$``, any arrow spec (``<-``, ``latex-latex``,
+``-{Stealth[length=2mm]}``), arrows set for the whole picture or a scope or
+through a style (``name/.style={..}`` in the picture's or a scope's options,
+``\\tikzset``, ``\\tikzstyle``, ``every edge``), and comments.
 That gives:
-  * checks — braces balance, every edge's endpoints are declared vertices,
-    the picture has vertices, every statement that draws something was
-    understood, no constructs we cannot verify (\\foreach);
+  * checks — braces balance, one picture (a figure with several panels is
+    drawn as one, with scopes), every edge's endpoints are declared
+    vertices, the picture has vertices, every statement that draws
+    something was understood, no constructs we cannot verify (\\foreach);
   * data — the vertex/edge lists go into the page JSON (meta["graph"]), so
     graphs are queryable and can be scored against ground truth (design §7).
 """
@@ -34,6 +37,11 @@ import re
 from typing import Optional
 
 _ENV = re.compile(r"\\begin\{tikzpicture\}(.*?)\\end\{tikzpicture\}", re.S)
+_DRAWING = re.compile(r"\\(?:node|draw|path|fill|filldraw|coordinate|graph|foreach|matrix)\b")
+_STYLE_KEY = re.compile(r"\s*(.+?)\s*/\.(append )?style\s*")
+# The position part of label=<pos>:<text>: above, below left, north east, 45, ...
+_LABEL_POS = re.compile(r"\s*(?:[-+]?\d+(?:\.\d+)?|(?:above|below|left|right|north|south|east"
+                        r"|west|center)(?:\s+(?:left|right|east|west))?)\s*")
 # One side of an arrow spec that draws an arrowhead: < or >, or a tip that
 # points (latex, Stealth, to, Triangle, angle 90, Kite, Straight Barb, ...),
 # possibly braced with options ({Stealth[length=2mm]}). Other tips (bars,
@@ -156,25 +164,58 @@ def _split_top(s: str, sep: str, maxsplit: int = -1) -> list[str]:
     return out + [s[start:]]
 
 
+def _unbrace(s: str) -> str:
+    """'{-Latex}' -> '-Latex': one group around a whole option value."""
+    sc = _Scan(s)
+    inner = sc.group("{", "}")
+    return inner.strip() if inner is not None and sc.done() else s.strip()
+
+
+def _add_styles(opts: str, styles: dict) -> None:
+    """Record the styles an option list defines: name/.style={..} and
+    name/.append style={..}."""
+    for item in _split_top(opts, ","):
+        kv = _split_top(item, "=", 1)
+        m = _STYLE_KEY.fullmatch(kv[0]) if len(kv) == 2 else None
+        if m:
+            before = styles.get(m.group(1), "") + "," if m.group(2) else ""
+            styles[m.group(1)] = before + _unbrace(kv[1])
+
+
+def _expand(opts: str, styles: dict, depth: int = 0) -> str:
+    """The option list with each style it uses replaced by the style's
+    options (#1 by the value of name=value), as TikZ applies them."""
+    if depth > 8:
+        raise ValueError("a style that uses itself")
+    out = []
+    for item in _split_top(opts, ","):
+        key, *value = _split_top(item, "=", 1)
+        if key.strip() in styles:
+            arg = _unbrace(value[0]) if value else ""
+            item = _expand(styles[key.strip()].replace("#1", arg), styles, depth + 1)
+        out.append(item)
+    return ",".join(out)
+
+
 def _direction(opts: str) -> Optional[str]:
     """The arrows an option list sets: 'forward', 'back', 'both', 'none' (an
     explicit '-', or tips without a head), or None when it sets no arrows.
     The arrow spec is the option with a '-' outside groups and no '=' (so
     out=-30 and >=stealth are not specs), or the value of arrows=; the two
-    sides of that '-' are the start and end tips."""
+    sides of that '-' are the start and end tips. As in TikZ, the last
+    spec wins."""
+    found = None
     for item in _split_top(opts, ","):
         kv = _split_top(item, "=", 1)
         if len(kv) == 2:
             if kv[0].strip() != "arrows":
                 continue
-            sc = _Scan(kv[1])           # arrows={-Latex}
-            inner = sc.group("{", "}")
-            item = inner if inner is not None and sc.done() else kv[1]
+            item = _unbrace(kv[1])      # arrows={-Latex}
         sides = _split_top(item, "-", 1)
         if len(sides) == 2:
             start, end = (bool(_HEAD.match(x)) for x in sides)
-            return ("both" if start else "forward") if end else ("back" if start else "none")
-    return None
+            found = ("both" if start else "forward") if end else ("back" if start else "none")
+    return found
 
 
 def _arrows(*opts: str) -> Optional[str]:
@@ -183,12 +224,14 @@ def _arrows(*opts: str) -> Optional[str]:
 
 
 def _draws(opts: str) -> Optional[bool]:
-    """True for a draw (or draw=<colour>) option, False for draw=none, else None."""
+    """True for a draw (or draw=<colour>) option, False for draw=none, else
+    None. As in TikZ, the last one wins."""
+    found = None
     for item in _split_top(opts, ","):
         key, *value = [x.strip() for x in _split_top(item, "=", 1)]
         if key == "draw":
-            return value != ["none"]
-    return None
+            found = value != ["none"]
+    return found
 
 
 def _float(s: str) -> Optional[float]:
@@ -198,13 +241,29 @@ def _float(s: str) -> Optional[float]:
         return None
 
 
+def _label_option(opts: list[str]) -> str:
+    """The text of a label=<pos>:<text> node option, or ''."""
+    for o in opts:
+        for item in _split_top(o, ","):
+            key, *value = _split_top(item, "=", 1)
+            if key.strip() == "label" and value:
+                v = re.sub(r"^\[[^\]]*\]", "", _unbrace(value[0]))     # {[red]above:$x$}
+                pos, *text = _split_top(v, ":", 1)
+                return _unbrace(text[0] if text and _LABEL_POS.fullmatch(pos) else v)
+    return ""
+
+
 def _parse_node(sc: _Scan) -> dict:
     """[opts] (name) at (x,y) {label}: options, name, and position in any
     order, as TikZ allows (\\node (b) [right=of a] {..}, \\node at (3,0)
-    (c) {..}); the {label} must come last."""
+    (c) {..}); the {label} must come last. An empty {label} takes the text
+    of a label= option (\\node[label=above:$v_1$] (v1) at (0,0) {};)."""
     nid = x = y = None
+    opts: list[str] = []
     while True:
-        if sc.group("[", "]") is not None:
+        o = sc.group("[", "]")
+        if o is not None:
+            opts.append(o)
             continue
         if sc.take("at"):
             parts = (sc.group("(", ")") or "").split(",")
@@ -223,14 +282,15 @@ def _parse_node(sc: _Scan) -> dict:
         raise ValueError("node without a {label}")
     if not sc.done():
         raise ValueError(f"unexpected text after the node label: {sc.s[sc.i:sc.i + 25]!r}")
-    return {"id": nid, "label": label.strip(), "x": x, "y": y}
+    return {"id": nid, "label": label.strip() or _label_option(opts), "x": x, "y": y}
 
 
-def _parse_path(sc: _Scan, kind: str, inherited: list[str]) -> list[dict]:
+def _parse_path(sc: _Scan, kind: str, inherited: list[str], styles: dict) -> list[dict]:
     """Edges of one \\draw / \\path statement. ``inherited``: the option
     lists of the enclosing scopes and the picture, innermost first (their
-    arrows apply when the path sets none)."""
-    path_opts = sc.group("[", "]") or ""
+    arrows apply when the path sets none). ``styles``: the styles defined so
+    far, expanded wherever an option list uses one."""
+    path_opts = _expand(sc.group("[", "]") or "", styles)
     edges: list[dict] = []
     current = sc.name()
     if current is None:
@@ -239,10 +299,11 @@ def _parse_path(sc: _Scan, kind: str, inherited: list[str]) -> list[dict]:
     while not sc.done():
         if sc.take("--"):
             pending = ("--", "", None)
-        elif sc.take("edge"):
-            pending = ("edge", sc.group("[", "]") or "", None)
+        elif sc.take("edge"):           # TikZ applies "every edge" first
+            pending = ("edge", _expand("every edge," + (sc.group("[", "]") or ""), styles),
+                       None)
         elif sc.take("to"):
-            pending = ("to", sc.group("[", "]") or "", None)
+            pending = ("to", _expand(sc.group("[", "]") or "", styles), None)
         elif sc.take("node"):
             sc.group("[", "]")
             label = (sc.group("{", "}") or "").strip()
@@ -271,7 +332,7 @@ def _parse_path(sc: _Scan, kind: str, inherited: list[str]) -> list[dict]:
                 # surely meant as one.
                 raise ValueError("arrows on a path that is not drawn (use \\draw)")
             if drawn:
-                direction = own or _arrows(*inherited) or "none"
+                direction = own or _arrows(*(_expand(o, styles) for o in inherited)) or "none"
                 u, v = (target, current) if direction == "back" else (current, target)
                 edges.append({"u": u, "v": v,
                               "directed": direction in ("forward", "back", "both"),
@@ -285,19 +346,24 @@ def _parse_path(sc: _Scan, kind: str, inherited: list[str]) -> list[dict]:
     return edges
 
 
-def _settings(sc: _Scan, scopes: list[str]) -> None:
+def _settings(sc: _Scan, scopes: list[str], styles: dict) -> None:
     """Consume what may come before a statement's command: \\tikzset{..} and
-    \\tikzstyle{..}=[..] (often written without a ';'), and \\begin{scope}[..]
-    / \\end{scope}, whose options ``scopes`` tracks (outermost first)."""
+    \\tikzstyle{..}=[..] (often written without a ';'), whose style
+    definitions go into ``styles``, and \\begin{scope}[..] / \\end{scope},
+    whose options ``scopes`` tracks (outermost first)."""
     while True:
         if sc.take("\\tikzset"):
-            sc.group("{", "}")
+            _add_styles(sc.group("{", "}") or "", styles)
         elif sc.take("\\tikzstyle"):
-            sc.group("{", "}")
+            name = (sc.group("{", "}") or "").strip()
+            append = sc.take("+")
             sc.take("=")
-            sc.group("[", "]")
+            opts = sc.group("[", "]") or ""
+            if name:
+                styles[name] = styles.get(name, "") + "," + opts if append else opts
         elif sc.take("\\begin{scope}"):
             scopes.append(sc.group("[", "]") or "")
+            _add_styles(scopes[-1], styles)
         elif sc.take("\\end{scope}"):
             if len(scopes) > 1:          # scopes[0] is the picture's
                 scopes.pop()
@@ -311,19 +377,32 @@ def parse_graph(code: str) -> tuple[Optional[dict], list[str], list[str]]:
     flags, problems = [], []
     if not braces_balanced(code):
         return None, ["tikz_parse"], ["unbalanced braces"]
-    m = _ENV.search(code)
-    if not m:
+    pictures = _ENV.findall(code)
+    if not pictures:
         return None, ["tikz_parse"], ["no \\begin{tikzpicture} ... \\end{tikzpicture}"]
-    body = _Scan(m.group(1))
-    try:                    # \begin{tikzpicture}[->, >=stealth]: for every path
+    if len(pictures) > 1:
+        return None, ["tikz_parse"], ["more than one tikzpicture: draw all panels in one "
+                                      "picture, each in its own \\begin{scope}[xshift=...]"]
+    outside = _ENV.sub(" ", code)
+    if _DRAWING.search(outside):
+        return None, ["tikz_parse"], ["drawing commands outside the tikzpicture"]
+    styles: dict = {}
+    body = _Scan(pictures[0])
+    try:
+        for m in re.finditer(r"\\tikz(?:set|style)\b", outside):   # e.g. before the picture
+            sc = _Scan(outside)
+            sc.i = m.start()
+            _settings(sc, [], styles)
+        # \begin{tikzpicture}[->, >=stealth, arc/.style={..}]: for every path
         scopes = [body.group("[", "]") or ""]
-    except ValueError:
-        return None, ["tikz_parse"], ["unclosed [ after \\begin{tikzpicture}"]
+        _add_styles(scopes[0], styles)
+    except ValueError as e:
+        return None, ["tikz_parse"], [f"{e} in the picture's options or styles"]
     nodes, edges = [], []
     for st in _statements(body.s[body.i:]):
         sc = _Scan(st)
         try:
-            _settings(sc, scopes)
+            _settings(sc, scopes, styles)
             # Resume at the command: skip a font switch or \def before it,
             # but not \fill, \coordinate, \graph, ... — they draw something
             # we cannot read, and the graph would be silently incomplete.
@@ -336,9 +415,9 @@ def parse_graph(code: str) -> tuple[Optional[dict], list[str], list[str]]:
             if sc.take("\\node"):
                 nodes.append(_parse_node(sc))
             elif sc.take("\\draw"):
-                edges.extend(_parse_path(sc, "draw", scopes[::-1]))
+                edges.extend(_parse_path(sc, "draw", scopes[::-1], styles))
             elif sc.take("\\path"):
-                edges.extend(_parse_path(sc, "path", scopes[::-1]))
+                edges.extend(_parse_path(sc, "path", scopes[::-1], styles))
             else:
                 flags.append("tikz_unsupported")
                 problems.append("\\foreach is not allowed: write every vertex and edge out")

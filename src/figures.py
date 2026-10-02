@@ -15,7 +15,9 @@ asked to classify each figure and, by kind, to emit:
                       is sent back to the reviewer once with the problems.
                       If it still fails, the figure is flagged (tikz_*), the
                       Markdown version says it is unavailable, and the
-                      partial parse is kept as meta["graph_partial"].
+                      partial parse is kept as meta["graph_partial"]. An
+                      answer with no TikZ at all is sent back the same way
+                      (tikz_missing).
   diagram             Mermaid (renders natively on GitHub / Obsidian)
   commutative_diagram tikz-cd
   plot                series, axes, and legible key values
@@ -46,6 +48,8 @@ _FENCE = {"graph": "latex", "diagram": "mermaid",
 _TIKZ_KINDS = ("graph", "commutative_diagram")    # checked; sent back on failure
 _CUT_OFF = ("the answer was cut off at the length limit: write the TikZ compactly, "
             "one line per vertex and edge")
+_MISSING = "no {} was given: write it inside <structure> ... </structure>"
+_CODE = re.compile(r"```[^\n`]*\n(.*?)\n?```", re.S)
 
 # Built with str.replace, not str.format: the TikZ example is full of braces.
 DESCRIBE_PROMPT = r"""This image is a figure from a research paper.
@@ -106,16 +110,25 @@ def caption_for(blocks: list[Block], i: int) -> str:
 def parse_description(reply: str) -> dict:
     """-> {kind, summary, structure} (+ truncated=True for a reply cut off at
     the length limit; the marker itself is removed). Tolerates Markdown
-    around the label and value: **KIND:** graph, KIND: `commutative diagram`."""
+    around the label and value (**KIND:** graph, KIND: `commutative diagram`)
+    and a structure in a code fence after the description instead of in its
+    tags (as review.parse_reply does)."""
     truncated = TRUNCATION_MARKER.strip() in reply
     reply = reply.replace(TRUNCATION_MARKER.strip(), "")
     m = re.search(r"\bKIND\W*:\W*([a-z_ ]+)", reply, re.I)
     kind = re.sub(r"\s+", "_", m.group(1).strip().lower()) if m else "other"
     kind = next((k for k in FIGURE_KINDS                 # "graph drawing" -> graph
                  if kind == k or kind.startswith(k + "_")), "other")
-    d = re.search(r"<description>\s*(.*?)\s*(?:</description>|<structure>|$)", reply, re.S)
+    d = (re.search(r"<description>\s*(.*?)\s*</description>", reply, re.S)
+         or re.search(r"<description>\s*(.*?)\s*(?:<structure>|(?=\n```)|$)", reply, re.S))
     s = re.search(r"<structure>\s*(.*?)\s*(?:</structure>|$)", reply, re.S)
-    structure = s.group(1).strip() if s else ""
+    if s:
+        structure = s.group(1).strip()
+    elif kind in _FENCE:                    # a kind that has a structure
+        fences = _CODE.findall(reply[d.end():] if d else reply)
+        structure = fences[-1].strip() if fences else ""
+    else:
+        structure = ""
     structure = re.sub(r"^```[a-z-]*\n|\n?```$", "", structure).strip()
     info = {"kind": kind, "summary": d.group(1).strip() if d else "",
             "structure": structure}
@@ -127,10 +140,15 @@ def parse_description(reply: str) -> dict:
 def check_structure(info: dict) -> tuple[dict, list[str], list[str]]:
     """Normalise and check a graph / commutative-diagram transcription.
     -> (info with normalised structure (+ parsed graph), flags, problems).
-    A cut-off answer fails the check for every kind (description_truncated)."""
+    A cut-off answer fails the check for every kind (description_truncated),
+    and so does a graph or commutative diagram with no structure at all
+    (tikz_missing)."""
     flags, problems = (["description_truncated"], [_CUT_OFF]) if info.get("truncated") \
         else ([], [])
     if not info.get("structure"):
+        if info["kind"] in _TIKZ_KINDS and not flags:
+            what = "TikZ" if info["kind"] == "graph" else "tikz-cd code"
+            return info, ["tikz_missing"], [_MISSING.format(what)]
         return info, flags, problems
     if info["kind"] == "graph":
         info = dict(info, structure=normalise(info["structure"]))
@@ -149,7 +167,8 @@ def format_description(info: dict, problems: Sequence[str] = ()) -> str:
     """The Markdown description. ``problems`` are what the final check found
     (check_structure): with any, a graph's Markdown version says it is
     unavailable instead of rendering a partial parse that would contradict
-    the TikZ shown below it. A cut-off answer's structure is left out."""
+    the TikZ shown below it, and a graph given without TikZ says so. A
+    cut-off answer's structure is left out."""
     out = f"**Kind:** {info['kind']}. {info['summary']}".strip()
     if info.get("truncated"):
         return out + ("\n\n*(cut off at the length limit: the description may be "
@@ -166,6 +185,8 @@ def format_description(info: dict, problems: Sequence[str] = ()) -> str:
             md = f"*(not available: the TikZ below failed the checks: {why})*"
         out += (f"\n\n**Graph — Markdown (simple):** {md}"
                 f"\n\n**Graph — TikZ:**\n\n```latex\n{info['structure']}\n```")
+    elif info["kind"] == "graph":
+        out += "\n\n**Graph — Markdown (simple):** *(not available: no TikZ was given)*"
     elif info.get("structure"):
         fence = _FENCE.get(info["kind"], "text")
         out += f"\n\n```{fence}\n{info['structure']}\n```"
@@ -232,7 +253,7 @@ def _describe(client, page, k, b, model_tag, repair):
         if not flags or info["kind"] not in _TIKZ_KINDS or attempt == repair:
             break
         prompt = base + REPAIR_SUFFIX.replace("<<PROBLEMS>>", "\n".join(
-            f"- {x}" for x in problems)).replace("<<PREVIOUS>>", info["structure"])
+            f"- {x}" for x in problems)).replace("<<PREVIOUS>>", info["structure"] or "(none)")
     b.meta["kind"] = info["kind"]
     b.meta["description"] = format_description(info, problems)
     b.meta["description_source"] = model_tag

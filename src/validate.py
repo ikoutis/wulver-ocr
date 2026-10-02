@@ -13,7 +13,12 @@ Flags:
                    content, or the block is the empty tail a reader adds for
                    the part of the page its cut-off output lost
                    (meta["truncated_tail"])
-  repetition       degenerate loop (the classic VLM-OCR failure mode)
+  repetition       degenerate loop (the classic VLM-OCR failure mode), or the
+                   reader kept one copy of an element its model wrote
+                   several times (meta["repeated"] = n >= 2)
+  json_repaired    the reader had to repair invalid escapes in this
+                   element's JSON (meta["json_repaired"]), so its LaTeX may
+                   have been decoded wrongly
   latex_braces     unbalanced { } in math
   latex_env        \\begin/\\end mismatch
   latex_leftright  \\left/\\right count mismatch
@@ -22,7 +27,8 @@ Flags:
                    available; see katex_check.py)
   latex_unchecked  KaTeX is installed but its worker could not be run, so
                    the parse was not checked
-  inline_math      odd number of unescaped $ in a text block
+  inline_math      odd number of unescaped $ in a text block, or a $$ that
+                   opens display math and is never closed
   table_shape      rows with inconsistent effective column counts
   table_parse      table content is neither parseable HTML nor GFM
 """
@@ -179,23 +185,33 @@ def strip_math_delims(s: str) -> str:
 
 _DISPLAY_MATH = re.compile(r"(?<!\\)\$\$(.+?)(?<!\\)\$\$", re.S)
 _INLINE_MATH = re.compile(r"(?<!\\)\$(?!\$)(.+?)(?<!\\)\$", re.S)
+# A $$ with a space (or the start or end) on one side cannot be the closing $
+# of one inline math and the opening $ of the next ("$a$$b$"): it opens or
+# closes display math.
+_LONE_DISPLAY = re.compile(r"(?<!\S)\$\$|(?<![\\$])\$\$(?!\S)")
 
 
 def check_inline_math(text: str) -> list[str]:
     """Math in running text. Display math inside a paragraph ($$...$$, as a
     reader writes a display formula nested in a <p>) is checked in display
     mode and taken out first, so that the $ pairing of the inline math
-    around it stays right."""
+    around it stays right. A $$ left over after that is display math that
+    is never closed."""
     flags = []
     for m in _DISPLAY_MATH.finditer(text):
         flags.extend(check_latex(m.group(1), display=True))
     text = _DISPLAY_MATH.sub(" ", text)
     unescaped = re.sub(r"\\\$", "", text).replace("$$", "")
-    if unescaped.count("$") % 2:
+    if unescaped.count("$") % 2 or _LONE_DISPLAY.search(text):     # unpaired $ or $$
         return sorted(set(flags) | {"inline_math"})
     for m in _INLINE_MATH.finditer(text):
         flags.extend(check_latex(m.group(1), display=False))
     return sorted(set(flags))
+
+
+def outside_math(text: str) -> str:
+    """Running text with its $$...$$ and $...$ math taken out."""
+    return _INLINE_MATH.sub(" ", _DISPLAY_MATH.sub(" ", text))
 
 
 # --------------------------------------------------------------------- tables
@@ -271,6 +287,14 @@ def validate_block(b: Block) -> list[str]:
     if (c.endswith(TRUNCATION_MARKER) or "<<TRUNCATED>>" in c
             or (b.meta.get("truncated_tail") and not c.strip())):
         flags.append("truncated")
+    # What a reader noticed about its own output lives in meta (flags are
+    # recomputed here). It describes the reader's text, so it stops applying
+    # once a reviewer's accepted edit has replaced that text.
+    if b.meta.get("reviewed") != "edited":
+        if b.meta.get("json_repaired"):
+            flags.append("json_repaired")
+        if (b.meta.get("repeated") or 0) >= 2:
+            flags.append("repetition")
     c = c.replace(TRUNCATION_MARKER, "")
     if b.type == "figure":
         return sorted(set(flags))

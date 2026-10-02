@@ -221,8 +221,13 @@ class TestReviewBlock:
             return b
         b, _ = self.run(tail(), reply("correct", "", "text"))        # nothing there
         assert b.meta["reviewed"] == "agreed" and b.flags == ["empty", "truncated"]
+        # "correct" means nothing to transcribe, whatever came with it
         b, _ = self.run(tail(), reply("correct", "A last line.", "text"))
+        assert b.meta["reviewed"] == "agreed" and b.content == ""
+        assert b.flags == ["empty", "truncated"]
+        b, _ = self.run(tail(), reply("fixed", "A last line.", "text"))
         assert b.meta["reviewed"] == "edited" and b.content == "A last line."
+        assert b.meta["tail_recovered"]
         b, _ = self.run(tail(), reply("unreadable", "", "text"))
         assert b.flags == ["empty", "truncated", "unreadable"]
 

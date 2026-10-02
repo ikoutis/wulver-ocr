@@ -65,79 +65,122 @@ CATEGORY_MAP = {
 # the braces of LaTeX inside text strings.
 _ELEMENT = re.compile(r'\{\s*"(?:bbox|category|text)"\s*:')
 _STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
-_JSON_ESCAPE = re.compile(r"\\(u[0-9a-fA-F]{4}|.)(?=([A-Za-z]?))", re.S)
+_PAIR = re.compile(r"\\(.)", re.S)
+_HEX4 = re.compile(r"[0-9a-fA-F]{4}")
+_LETTER = re.compile(r"[A-Za-z]")
 _CONTROL = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 # No line of a formula starts with these: after "\n" they are \nabla, \neq, …
 _N_COMMAND = re.compile(r"(?:abla|eq|eg|otin|mid|leq|geq|exists|ewline)(?![A-Za-z])")
+# Inline math is one line, so there also \nu, \ne, \not ('e.g.' after a
+# newline is no \ne, should a lone $ have opened "math").
+_N_INLINE = re.compile(r"(?:abla|eq|eg|otin|mid|leq|geq|exists|ewline)(?![A-Za-z])"
+                       r"|(?:ot|u|e)(?![A-Za-z.])")
+# A doubled backslash before one of these is an escaped LaTeX command (\\alpha,
+# \\{, \\|, \\,, \\)), or half of a doubled row break (\\\\): the writer escapes
+# its backslashes. (A single-backslash row break, \\, comes before a space, a
+# newline, a [spacing], a digit or a $.)
+_DOUBLED = re.compile(r"[A-Za-z{}|,;:!%_#()\]]|\\\\")
 _REPAIRED = "\x00"      # marks a repaired "text" until parse_layout reads it
 
 
-def _latex_escape(m: re.Match, formula: bool) -> bool:
-    """An escape no JSON writer means: an invalid one (\\alpha, \\in), a
-    backspace, form feed, CR or TAB before a letter (\\beta, \\frac, \\rho,
-    \\theta), or in a formula a newline before 'abla', 'eq', … (\\nabla,
-    \\neq). Each is LaTeX written with single backslashes."""
-    e, letter = m.group(1), m.group(2)
-    if len(e) > 1 or e in '"\\/':
-        return False
-    if e == "n":
-        return formula and bool(_N_COMMAND.match(m.string, m.end()))
-    return e not in "bfrt" or bool(letter)
-
-
-def _single_backslash(body: str, formula: bool) -> str:
-    """The text a JSON string body means when its LaTeX has single
-    backslashes. Its escapes are LaTeX, except \\" \\/ \\uXXXX, the control
-    escapes \\b \\f \\n \\r \\t when no letter follows, and \\n outside math
-    (a newline: inside math it is \\nabla, \\neq, \\nu). A doubled backslash
-    before a letter is an escaped command (\\\\frac), elsewhere it is a LaTeX
-    row break (\\\\). ``formula``: the whole body is math."""
-    out, math, i = [], formula, 0
+def _escapes(body: str, formula: bool, doubled: bool) -> list[tuple[int, str, str]]:
+    """[(index, escaped character, math)] for each backslash escape of a
+    JSON string body, in order. ``math`` is "inline" or "display" for an
+    escape in math ($…$, $$…$$, or a formula's whole body), else "". An
+    escaped dollar does not open math (\\$, and \\\\$ when ``doubled``)."""
+    out: list[tuple[int, str, str]] = []
+    math, i = "display" if formula else "", 0
     while i < len(body):
         c = body[i]
-        if c == "$":
+        if c == "\\" and i + 1 < len(body):
+            out.append((i, body[i + 1], math))
+            i += 2
+            if doubled and body[i - 1] == "\\" and body[i:i + 1] == "$":
+                i += 1                                  # \\$: an escaped $
+        elif c == "$" and not formula:
             j = i
             while j < len(body) and body[j] == "$":     # $$ is one delimiter
                 j += 1
-            out.append(body[i:j])
-            math, i = formula or not math, j
-            continue
-        if c != "\\" or i + 1 == len(body):
-            out.append(c)
+            math, i = ("" if math else "inline" if j - i == 1 else "display"), j
+        else:
             i += 1
-            continue
-        e, letter = body[i + 1], bool(re.match(r"[A-Za-z]", body[i + 2:i + 3]))
-        if e == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", body[i + 2:i + 6]):
+    return out
+
+
+def _latex_escape(body: str, i: int, e: str, math: str) -> bool:
+    """Is the escape at body[i] (a backslash, then e) LaTeX written with a
+    single backslash, which no JSON writer means: an invalid escape (\\alpha,
+    \\in, \\{), a backspace, form feed or CR before a letter (\\beta, \\frac,
+    \\rho), and in math a TAB before a letter (\\theta) or a newline before
+    'abla', 'eq', … (\\nabla, \\neq; in inline math also \\nu, \\ne, \\not).
+    A TAB before a letter outside math is a TAB."""
+    if e in '"\\/' or (e == "u" and _HEX4.match(body, i + 2)):
+        return False
+    letter = bool(_LETTER.match(body, i + 2))
+    if e in "bfr":
+        return letter
+    if e == "t":
+        return letter and bool(math)
+    if e == "n":
+        return bool(math) and bool(
+            (_N_INLINE if math == "inline" else _N_COMMAND).match(body, i + 2))
+    return True
+
+
+def _decode(body: str, formula: bool, doubled: bool) -> str:
+    """The text a JSON string body means when it holds LaTeX that some
+    escapes did not double (_latex_escape). ``formula``: the whole body is
+    math.
+
+    ``doubled``: the writer escapes its backslashes (it wrote \\\\alpha or
+    \\\\{ somewhere), so the body is JSON, and only the LaTeX escapes are
+    slips: those are kept as LaTeX, every other escape means what JSON
+    says (\\\\{ is \\{, \\t before a word outside math is a TAB). Else the
+    LaTeX has single backslashes: every escape is LaTeX except \\" \\/
+    \\uXXXX, the control escapes \\b \\f \\n \\r \\t when no letter follows,
+    and \\n outside math (a newline: inside math it is \\nabla, \\neq, \\nu);
+    a doubled backslash is a LaTeX row break (\\\\)."""
+    out, pos = [], 0
+    for i, e, math in _escapes(body, formula, doubled):
+        out.append(body[pos:i])
+        pos = i + 2
+        letter = bool(_LETTER.match(body, i + 2))
+        if e == "u" and _HEX4.match(body, i + 2):
             out.append(chr(int(body[i + 2:i + 6], 16)))
-            i += 6
-            continue
-        if e == "\\":
-            out.append("\\" if letter else "\\\\")
+            pos = i + 6
+        elif e == "\\":
+            out.append("\\" if doubled else "\\\\")
         elif e in '"/':
             out.append(e)
-        elif e in _CONTROL and (not letter or (e == "n" and not math)):
-            out.append(_CONTROL[e])
-        else:
+        elif _latex_escape(body, i, e, math) or (
+                not doubled and letter and (e in "bfrt" or (e == "n" and math))):
             out.append("\\" + e)
-        i += 2
+        else:
+            out.append(_CONTROL[e])
+    out.append(body[pos:])
     return "".join(out)
 
 
 def _repair_escapes(s: str) -> str:
-    """Single-backslash LaTeX in a reply (\\alpha, \\frac): every string
-    literal holding an escape no JSON writer means (_latex_escape) is read
-    as such (_single_backslash) and re-encoded, and a repaired "text" is
-    marked with _REPAIRED. Other literals, valid JSON included, are left
-    alone."""
+    """LaTeX with undoubled backslashes in a reply (\\alpha, \\frac): every
+    string literal holding an escape no JSON writer means (_latex_escape)
+    is decoded as such (_decode: per escape when the literal also holds
+    correctly doubled LaTeX, else as single-backslash LaTeX) and re-encoded,
+    and a repaired "text" is marked with _REPAIRED. Other literals, valid
+    JSON included, are left alone."""
     out, pos, formula = [], 0, False
     for m in _STRING.finditer(s):
         key = re.search(r'"(\w+)"\s*:\s*$', s[max(0, m.start() - 40):m.start()])
         key = key.group(1) if key else None
         if key == "category":               # it comes before the text
             formula = m.group(1).strip().lower() == "formula"
-        if not any(_latex_escape(e, formula) for e in _JSON_ESCAPE.finditer(m.group(1))):
+        body = m.group(1)
+        doubled = any(p.group(1) == "\\" and _DOUBLED.match(body, p.end())
+                      for p in _PAIR.finditer(body))
+        if not any(_latex_escape(body, i, e, math)
+                   for i, e, math in _escapes(body, formula, doubled)):
             continue
-        text = _single_backslash(m.group(1), formula)
+        text = _decode(body, formula, doubled)
         if key == "text":
             text = _REPAIRED + text
         out += [s[pos:m.start()], json.dumps(text, ensure_ascii=False)]

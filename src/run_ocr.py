@@ -12,7 +12,7 @@ Examples (servers started separately, e.g. by slurm/serve_lib.sh):
 
     python -m src.run_ocr ingest   --inputs papers/ --work work/
     python -m src.run_ocr read     --inputs papers/ --work work/ \\
-        --reader dots --reader-url http://127.0.0.1:8001
+        --reader chandra --reader-url http://127.0.0.1:8001
     python -m src.run_ocr review   --inputs papers/ --work work/ \\
         --editor-url http://127.0.0.1:8002
     python -m src.run_ocr assemble --inputs papers/ --work work/ --out out/
@@ -24,54 +24,64 @@ Work layout, per document (see ingest.py for doc ids):
                    /review/p0001.json    stage-2 blocks (history = provenance)
                    /figures/*.png
     <out>/<doc_id>/<doc_id>.md, figures/, report.json
+    <out>/<doc_id>/FAILED.json           the input could not be ingested
 
-Every page is written atomically when it finishes, and every stage skips
-pages already on disk (``--force`` redoes them), so a preempted or requeued
-job resumes where it stopped. On SIGUSR1/SIGTERM the current stage finishes
-the requests in flight, saves, and exits with code 85 — the convention
-slurm/requeue_lib.sh turns into a self-requeue.
+Resumability. Every page is written atomically when it finishes, and every
+stage skips pages already on disk (``--force`` redoes them), so a preempted
+or requeued job resumes where it stopped. Review requests are pooled across
+the whole shard and each page is saved as soon as all its requests are done.
+
+Failure semantics. A page whose reading fails deterministically (the server
+rejects the request, the adapter cannot parse the reply, the image cannot be
+decoded) is retried once with different decoding, then saved as a
+placeholder flagged ``page_failed`` so its document still assembles (report.json
+lists it; ``read --retry-failed`` tries again). A review request that fails
+deterministically is recorded as that block's final decision. A SERVER
+failure (unreachable, 5xx, timeouts) is never saved as done: the affected
+pages stay in ``todo`` and the command exits 3.
+
+Exit codes: 0 done; 85 stopped by SIGUSR1/SIGTERM after saving (requeue,
+see slurm/requeue_lib.sh); 3 model server failure (unfinished pages remain);
+2 usage error.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import shutil
-import signal
 import sys
-import time
-from collections import Counter
 
-from PIL import Image
+from .stopflag import STOP, Stopped, check_stop, install_signal_handlers
 
-from . import ingest as ing
-from .assemble import assemble
-from .backend import ChatClient, map_concurrent
-from .figures import crop_figures, describe_figures
-from .readers import READERS, get_reader
-from .review import ReviewPolicy, review_pages
-from .schema import Page, page_stem
-from .validate import validate_block
+if __name__ == "__main__":
+    # Before the heavy imports: a USR1 forwarded during interpreter start-up
+    # must set the flag, not kill the process.
+    install_signal_handlers()
+
+import argparse  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import shutil  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from collections import Counter, OrderedDict  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+from . import ingest as ing  # noqa: E402
+from .assemble import assemble  # noqa: E402
+from .backend import ChatClient, ServerError, map_concurrent  # noqa: E402
+from .figures import crop_figures, describe_figure, needs_description  # noqa: E402
+from .readers import READERS, get_reader  # noqa: E402
+from .review import ReviewPolicy, review_block  # noqa: E402
+from .schema import Block, Page, atomic_write_text, page_stem  # noqa: E402
+from .validate import validate_block  # noqa: E402
 
 EXIT_REQUEUE = 85
-STOP = {"flag": False}
+EXIT_SERVER = 3
 
 
-class Stopped(Exception):
-    pass
-
-
-def _on_signal(signum, _frame):
-    if not STOP["flag"]:
-        print(f"[signal {signum}] finishing in-flight work, then exiting "
-              f"{EXIT_REQUEUE}", file=sys.stderr, flush=True)
-    STOP["flag"] = True
-
-
-def _check_stop():
-    if STOP["flag"]:
-        raise Stopped()
+class ServerDown(Exception):
+    """Some work could not be done because a model server failed."""
 
 
 def log(msg: str):
@@ -92,21 +102,38 @@ def parse_shard(s: str | None) -> tuple[int, int]:
 
 def select_docs(args) -> list[str]:
     """Doc dirs this invocation works on: from --inputs (ingesting as needed)
-    or every ingested doc under --work; then this shard's slice."""
+    or every ingested doc under --work; then this shard's slice. An input
+    that cannot be ingested gets <out>/<doc_id>/FAILED.json (a terminal
+    state tools/incomplete.py counts as done) instead of blocking its shard."""
     i, n = parse_shard(args.shard)
     if args.inputs:
         paths = ing.discover(args.inputs)[i::n]
         ids = []
         for p in paths:
-            _check_stop()
+            check_stop()
             try:
                 ids.append(ing.ingest(p, args.work, dpi=args.dpi)["doc_id"])
-            except Exception as e:      # noqa: BLE001 — a corrupt file skips, loudly
+            except Exception as e:      # noqa: BLE001 — a corrupt file is marked, loudly
                 log(f"INGEST ERROR {p}: {e!r}")
+                _mark_ingest_failed(args, p, e)
+        ids = list(dict.fromkeys(ids))  # the same file twice is one document
         return [os.path.join(args.work, d) for d in ids]
     docs = sorted(d for d in os.listdir(args.work)
                   if os.path.exists(os.path.join(args.work, d, "manifest.json")))
     return [os.path.join(args.work, d) for d in docs[i::n]]
+
+
+def _mark_ingest_failed(args, path: str, err: Exception) -> None:
+    try:
+        doc_id = ing.make_doc_id(path, ing.sha256_file(path))
+    except OSError as e:                # unreadable: nothing to name it by
+        log(f"  (cannot hash {path} either: {e!r}; not marked)")
+        return
+    d = os.path.join(args.out or args.work, doc_id)
+    os.makedirs(d, exist_ok=True)
+    atomic_write_text(os.path.join(d, "FAILED.json"), json.dumps(
+        {"doc_id": doc_id, "source": os.path.abspath(path), "stage": "ingest",
+         "error": repr(err)[:800]}, indent=1))
 
 
 def load_manifest(doc_dir: str) -> dict:
@@ -141,13 +168,27 @@ def stage_ingest(args):
 
 
 def _read_one(reader, doc_dir: str, idx: int, retries: int) -> Page:
-    _check_stop()
+    """Read one page. Stopped/ServerError propagate (nothing is saved);
+    deterministic failures end in a saved placeholder page (see module doc)."""
+    check_stop()
     img_path = os.path.join(doc_dir, "pages", page_stem(idx) + ".png")
-    with Image.open(img_path) as im:
-        img = im.convert("RGB")
+    errors: list[str] = []
+    try:
+        with Image.open(img_path) as im:
+            img = im.convert("RGB")
+    except Exception as e:              # noqa: BLE001 — undecodable page image
+        return _save_failed_page(reader, doc_dir, idx, img_path, (0, 0), [repr(e)[:800]])
     best = None
     for attempt in range(retries + 1):
-        blocks = reader.read(img, attempt=attempt)
+        if attempt:
+            check_stop()                # no new generation after a stop request
+        try:
+            blocks = reader.read(img, attempt=attempt)
+        except (Stopped, ServerError):
+            raise
+        except Exception as e:          # noqa: BLE001 — rejected request / unparseable reply
+            errors.append(f"attempt {attempt}: {e!r}"[:800])
+            continue
         for b in blocks:
             b.flags = validate_block(b)
         degenerate = sum(1 for b in blocks
@@ -156,18 +197,43 @@ def _read_one(reader, doc_dir: str, idx: int, retries: int) -> Page:
             best = (degenerate, blocks, attempt)
         if degenerate == 0:
             break
+    if best is None:
+        return _save_failed_page(reader, doc_dir, idx, img_path, img.size, errors)
     _, blocks, attempt = best
     page = Page(doc_id=os.path.basename(doc_dir), index=idx, image=img_path,
                 width=img.width, height=img.height, blocks=blocks,
                 reader=reader.tag, stage="read",
-                meta={"reader_attempt": attempt})
+                meta={"reader_attempt": attempt, **({"errors": errors} if errors else {})})
     crop_figures([page], doc_dir)
+    _save_read(doc_dir, page)
+    return page
+
+
+def _save_failed_page(reader, doc_dir, idx, img_path, size, errors) -> Page:
+    log(f"read FAILED {os.path.basename(doc_dir)} page {idx + 1}: {errors[-1]}")
+    page = Page(doc_id=os.path.basename(doc_dir), index=idx, image=img_path,
+                width=size[0], height=size[1], reader=reader.tag, stage="read",
+                blocks=[Block(type="other", content="", source=reader.tag,
+                              flags=["page_failed"], meta={"error": errors[-1]})],
+                meta={"failed": True, "errors": errors})
+    _save_read(doc_dir, page)
+    return page
+
+
+def _save_read(doc_dir: str, page: Page) -> None:
     os.makedirs(os.path.join(doc_dir, "read"), exist_ok=True)
-    page.save(os.path.join(doc_dir, "read", page_stem(idx) + ".json"))
-    stale = os.path.join(doc_dir, "review", page_stem(idx) + ".json")
+    page.save(os.path.join(doc_dir, "read", page_stem(page.index) + ".json"))
+    stale = os.path.join(doc_dir, "review", page_stem(page.index) + ".json")
     if os.path.exists(stale):          # a re-read invalidates the old review
         os.remove(stale)
-    return page
+
+
+def _page_failed(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return bool(json.load(f).get("meta", {}).get("failed"))
+    except (OSError, ValueError):
+        return True                     # unreadable JSON: read it again
 
 
 def stage_read(args):
@@ -181,16 +247,45 @@ def stage_read(args):
     for d in docs:
         n = load_manifest(d)["n_pages"]
         for k in range(n):
-            done = os.path.exists(os.path.join(d, "read", page_stem(k) + ".json"))
-            if args.force or not done:
+            path = os.path.join(d, "read", page_stem(k) + ".json")
+            if args.force or not os.path.exists(path) or (
+                    args.retry_failed and _page_failed(path)):
                 todo.append((d, k))
     log(f"read: {len(todo)} page(s) to do across {len(docs)} document(s)")
     t0 = time.time()
     results = map_concurrent(lambda dk: _read_one(reader, dk[0], dk[1], args.retries),
                              todo, args.workers)
-    _report_failures("read", todo, results)
-    ok = sum(1 for r in results if isinstance(r, Page))
-    log(f"read: {ok}/{len(todo)} pages in {time.time() - t0:.0f}s")
+    server = [r for r in results if isinstance(r, ServerError)]
+    for it, r in zip(todo, results):
+        if isinstance(r, Exception) and not isinstance(r, (Stopped, ServerError)):
+            log(f"read ERROR {it}: {r!r}")      # a bug: the page stays in todo
+    ok = [r for r in results if isinstance(r, Page)]
+    failed = sum(bool(p.meta.get("failed")) for p in ok)
+    log(f"read: {len(ok)}/{len(todo)} pages saved ({failed} as failed placeholders) "
+        f"in {time.time() - t0:.0f}s")
+    if server:
+        raise ServerDown(f"{len(server)} page(s) not read: {server[0]}")
+
+
+class _ImageCache:
+    """Small thread-safe LRU of decoded page images: review items are pooled
+    across the shard, and decoding every page up front would not fit in RAM."""
+
+    def __init__(self, maxsize: int):
+        self.maxsize, self._d, self._lock = maxsize, OrderedDict(), threading.Lock()
+
+    def get(self, path: str) -> Image.Image:
+        with self._lock:
+            if path in self._d:
+                self._d.move_to_end(path)
+                return self._d[path]
+        with Image.open(path) as im:
+            img = im.convert("RGB")
+        with self._lock:
+            self._d[path] = img
+            while len(self._d) > self.maxsize:
+                self._d.popitem(last=False)
+        return img
 
 
 def stage_review(args):
@@ -202,33 +297,77 @@ def stage_review(args):
         flagged=not args.no_flagged, max_change=args.max_change,
         max_change_flagged=args.max_change_flagged)
     log(f"reviewer {tag} @ {args.editor_url}; types={sorted(policy.review_types)} "
-        f"flagged={policy.flagged}")
-    docs = select_docs(args)
-    for d in docs:
-        _check_stop()
-        n = load_manifest(d)["n_pages"]
-        pages = []
-        for k in range(n):
+        f"flagged={policy.flagged} figures={args.describe_figures}")
+
+    # One pool for the whole shard: every wanted block and every figure of
+    # every page not yet reviewed. A page is saved the moment its last item
+    # finishes, so a stop or a server failure loses only unfinished pages.
+    pages: dict[tuple, Page] = {}
+    pending: dict[tuple, int] = {}
+    items: list[tuple] = []
+    for d in select_docs(args):
+        for k in range(load_manifest(d)["n_pages"]):
             if not args.force and os.path.exists(
                     os.path.join(d, "review", page_stem(k) + ".json")):
                 continue
             p = load_page(d, "read", k)
-            if p is not None:
-                pages.append(p)
-        if not pages:
-            continue
-        review_pages(client, pages, policy, tag, workers=args.workers)
-        if args.describe_figures:
-            describe_figures(client, pages, tag, workers=args.workers)
-        # A stop mid-document discards this document's review (it is redone
-        # whole on resume) rather than saving pages reviewed only in part.
-        _check_stop()
-        os.makedirs(os.path.join(d, "review"), exist_ok=True)
-        for p in pages:
-            p.save(os.path.join(d, "review", page_stem(p.index) + ".json"))
-        c = Counter(b.meta.get("reviewed") for p in pages for b in p.blocks
-                    if b.meta.get("reviewed"))
-        log(f"review {os.path.basename(d)}: {len(pages)} pages, {dict(c)}")
+            if p is None:
+                continue
+            its = [("block", i) for i, b in enumerate(p.blocks) if policy.wants(b)]
+            if args.describe_figures:
+                its += [("figure", i) for i, b in enumerate(p.blocks) if needs_description(b)]
+            pages[(d, k)], pending[(d, k)] = p, len(its)
+            items += [((d, k), kind, i) for kind, i in its]
+    log(f"review: {len(items)} request(s) over {len(pages)} page(s)")
+
+    def save(key):
+        p = pages[key]
+        p.stage = "review"
+        os.makedirs(os.path.join(key[0], "review"), exist_ok=True)
+        p.save(os.path.join(key[0], "review", page_stem(p.index) + ".json"))
+
+    saved, incomplete, server = 0, set(), []
+    for key, n in pending.items():
+        if n == 0:
+            save(key)
+            saved += 1
+    images = _ImageCache(maxsize=max(16, 2 * args.workers))
+
+    def run(item):
+        key, kind, i = item
+        p = pages[key]
+        if kind == "block":
+            review_block(client, images.get(p.image), p.blocks[i], policy, tag)
+        else:
+            describe_figure(client, p, i, tag)
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futures = {ex.submit(run, it): it for it in items}
+        for fut in as_completed(futures):
+            key, kind, i = futures[fut]
+            exc = fut.exception()
+            if isinstance(exc, ServerError):
+                server.append(exc)
+                incomplete.add(key)
+            elif isinstance(exc, Stopped):
+                incomplete.add(key)
+            elif exc is not None:       # review_block/describe_figure record their own
+                log(f"review ERROR {key} {kind} {i}: {exc!r}")
+                incomplete.add(key)     # a bug: keep the page in todo, visibly
+            pending[key] -= 1
+            if pending[key] == 0 and key not in incomplete:
+                save(key)
+                saved += 1
+    decisions = Counter(b.meta.get("reviewed") for key, p in pages.items()
+                        if key not in incomplete for b in p.blocks if b.meta.get("reviewed"))
+    errors = sum(1 for key, p in pages.items() if key not in incomplete
+                 for b in p.blocks if b.meta.get("description_error"))
+    log(f"review: {saved}/{len(pages)} pages saved in {time.time() - t0:.0f}s; "
+        f"decisions {dict(decisions)}; figure errors {errors}; "
+        f"{len(incomplete)} page(s) left for the next run")
+    if server:
+        raise ServerDown(f"{len(server)} request(s) failed: {server[0]}")
 
 
 def stage_assemble(args):
@@ -243,15 +382,14 @@ def stage_assemble(args):
         out_dir = os.path.join(out_root, man["doc_id"])
         os.makedirs(out_dir, exist_ok=True)
         md = assemble(pages, page_markers=not args.no_page_markers)
-        tmp = os.path.join(out_dir, man["doc_id"] + ".md.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(md)
-        os.replace(tmp, os.path.join(out_dir, man["doc_id"] + ".md"))
+        # Figures and report first; the .md is the completion marker
+        # (tools/incomplete.py, status), so it is written last.
         src_fig, dst_fig = os.path.join(d, "figures"), os.path.join(out_dir, "figures")
         if os.path.isdir(src_fig) and os.path.abspath(src_fig) != os.path.abspath(dst_fig):
             shutil.copytree(src_fig, dst_fig, dirs_exist_ok=True)
-        with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
-            json.dump(make_report(man, pages), f, indent=1)
+        atomic_write_text(os.path.join(out_dir, "report.json"),
+                          json.dumps(make_report(man, pages), indent=1))
+        atomic_write_text(os.path.join(out_dir, man["doc_id"] + ".md"), md)
         log(f"assembled {out_dir}/{man['doc_id']}.md")
 
 
@@ -261,6 +399,9 @@ def make_report(man: dict, pages: list[Page]) -> dict:
         "doc_id": man["doc_id"], "source": man["source"], "n_pages": man["n_pages"],
         "readers": sorted({p.reader for p in pages}),
         "reviewed_pages": sum(p.stage == "review" for p in pages),
+        "failed_pages": [p.index + 1 for p in pages if p.meta.get("failed")],
+        "review_errors": sum(1 for b in blocks if b.meta.get("reviewed") == "error"
+                             or b.meta.get("description_error")),
         "block_types": dict(Counter(b.type for b in blocks)),
         "review": dict(Counter(b.meta.get("reviewed") for b in blocks
                                if b.meta.get("reviewed"))),
@@ -319,14 +460,6 @@ def _json_arg(s: str | None) -> dict:
     return d
 
 
-def _report_failures(stage, items, results):
-    for it, r in zip(items, results):
-        if isinstance(r, Stopped):
-            continue
-        if isinstance(r, Exception):
-            log(f"{stage} ERROR {it}: {r!r}")
-
-
 # --------------------------------------------------------------------- CLI
 
 
@@ -354,7 +487,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="output token cap per page (default: the adapter's)")
         p.add_argument("--reader-extra", help="JSON merged into every reader request")
         p.add_argument("--retries", type=int, default=1,
-                       help="re-reads of a page whose output looped or was cut off")
+                       help="re-reads of a page whose output looped, was cut off, "
+                            "or failed (then a placeholder is saved)")
+        p.add_argument("--retry-failed", action="store_true",
+                       help="also re-read pages saved as failed placeholders")
 
     def editor_args(p):
         p.add_argument("--editor-url", default="http://127.0.0.1:8002")
@@ -390,8 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     os.makedirs(args.work, exist_ok=True)
-    signal.signal(signal.SIGUSR1, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+    install_signal_handlers()
     stages = {"ingest": [stage_ingest], "read": [stage_read],
               "review": [stage_review], "assemble": [stage_assemble],
               "all": [stage_ingest, stage_read, stage_review, stage_assemble],
@@ -399,10 +534,17 @@ def main(argv=None) -> int:
     try:
         for st in stages:
             st(args)
-            _check_stop()
+            check_stop()
     except Stopped:
-        log(f"stopped by signal; state saved — exit {EXIT_REQUEUE} (requeue)")
+        log(f"stopped by signal; finished pages saved — exit {EXIT_REQUEUE} (requeue)")
         return EXIT_REQUEUE
+    except (ServerDown, ServerError) as e:
+        if STOP.is_set():   # at preemption the server is killed too: requeue
+            log(f"stopped by signal (server gone too: {e}) — exit {EXIT_REQUEUE}")
+            return EXIT_REQUEUE
+        log(f"MODEL SERVER FAILURE: {e}. Finished pages are saved; the rest stay "
+            f"in todo — exit {EXIT_SERVER}")
+        return EXIT_SERVER
     return 0
 
 

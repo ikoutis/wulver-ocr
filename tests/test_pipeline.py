@@ -112,14 +112,14 @@ def test_status(tmp_path, pdf_path, servers, capsys):
     assert rows[0][1:] == (2, 0, 0, False)
 
 
-def test_signal_stop_exits_85(tmp_path, pdf_path, servers, monkeypatch):
+def test_signal_stop_exits_85(tmp_path, pdf_path, servers):
     work = str(tmp_path / "work")
     run("ingest", "--inputs", pdf_path, "--work", work)
-    monkeypatch.setitem(run_ocr.STOP, "flag", True)
+    run_ocr.STOP.set()
     try:
         assert run("read", "--work", work, "--workers", "1") == run_ocr.EXIT_REQUEUE
     finally:
-        run_ocr.STOP["flag"] = False
+        run_ocr.STOP.clear()
     (doc,) = os.listdir(work)
     assert not os.path.exists(os.path.join(work, doc, "read"))
 

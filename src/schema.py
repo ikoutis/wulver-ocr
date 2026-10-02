@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
@@ -86,15 +87,36 @@ class Page:
 
     def save(self, path: str) -> None:
         """Atomic write: a killed job never leaves a half-written page."""
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(self.to_json())
-        os.replace(tmp, path)
+        atomic_write_text(path, self.to_json())
 
     @classmethod
     def load(cls, path: str) -> "Page":
         with open(path, encoding="utf-8") as f:
             return cls.from_dict(json.load(f))
+
+
+# mkstemp creates files 0600; outputs on /project are meant to be group-
+# readable, so apply the process umask as open() would. (Read once, at import,
+# because os.umask can only be read by setting it.)
+_UMASK = os.umask(0o022)
+os.umask(_UMASK)
+
+
+def atomic_write_text(path: str, text: str) -> None:
+    """Write via a uniquely named temp file in the same directory, then
+    rename: readers never see a partial file, and two writers of the same
+    path never share a temp file."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                               prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o666 & ~_UMASK)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def page_stem(index: int) -> str:

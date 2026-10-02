@@ -32,7 +32,8 @@ from typing import Optional
 
 from PIL import Image
 
-from .backend import ChatClient, image_part, map_concurrent, text_part
+from .backend import (ChatClient, ServerError, Stopped, check_stop, image_part,
+                      map_concurrent, text_part)
 from .schema import Block, Page
 from .validate import strip_math_delims, validate_block
 
@@ -167,7 +168,26 @@ def gate(block: Block, proposal: str, policy: ReviewPolicy) -> tuple[bool, str]:
 
 def review_block(client: ChatClient, page_img: Image.Image, block: Block,
                  policy: ReviewPolicy, model_tag: str) -> Block:
-    """Ask the reviewer about one block; apply the gate; record provenance."""
+    """Ask the reviewer about one block; apply the gate; record provenance.
+
+    Failure semantics (see backend.ChatClient): Stopped and ServerError
+    propagate — the block was not reviewed and its page must not be saved as
+    reviewed. Any other error (a 4xx RequestRejected, a parsing bug) is
+    deterministic: it is recorded as this block's final review decision
+    ("error"), so one bad request can never keep a page unreviewable."""
+    check_stop()
+    try:
+        return _review_block(client, page_img, block, policy, model_tag)
+    except (Stopped, ServerError):
+        raise
+    except Exception as e:      # noqa: BLE001 — recorded, not swallowed
+        block.history.append({"source": model_tag, "decision": f"error: {e!r}"})
+        block.meta["reviewed"] = "error"
+        return block
+
+
+def _review_block(client: ChatClient, page_img: Image.Image, block: Block,
+                  policy: ReviewPolicy, model_tag: str) -> Block:
     kind = prompt_kind(block.type)
     issues = (f"\nAutomatic checks flagged: {', '.join(block.flags)}.\n"
               if block.flags else "\n")
@@ -208,10 +228,11 @@ def review_block(client: ChatClient, page_img: Image.Image, block: Block,
 
 
 def review_pages(client: ChatClient, pages: list[Page], policy: ReviewPolicy,
-                 model_tag: str, workers: int = 16) -> list[Page]:
-    """Review every wanted block of these pages, blocks in parallel (the
-    server batches them). A block whose request failed is left as it was,
-    with the error in its history."""
+                 model_tag: str, workers: int = 16) -> set[int]:
+    """Review every wanted block of these pages concurrently (library helper;
+    the CLI pools blocks across a whole shard instead, see run_ocr).
+    Returns the indices of pages left INCOMPLETE (a block hit Stopped or
+    ServerError); only the other pages may be saved as reviewed."""
     images = {}
     for p in pages:
         with Image.open(p.image) as im:
@@ -220,9 +241,9 @@ def review_pages(client: ChatClient, pages: list[Page], policy: ReviewPolicy,
     results = map_concurrent(
         lambda pb: review_block(client, images[pb[0].index], pb[1], policy, model_tag),
         work, workers)
-    for (_, b), r in zip(work, results):
-        if isinstance(r, Exception):
-            b.history.append({"source": model_tag, "decision": f"error: {r!r}"})
+    incomplete = {p.index for (p, _), r in zip(work, results)
+                  if isinstance(r, (Stopped, ServerError))}
     for p in pages:
-        p.stage = "review"
-    return pages
+        if p.index not in incomplete:
+            p.stage = "review"
+    return incomplete

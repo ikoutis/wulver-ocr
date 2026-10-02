@@ -27,7 +27,8 @@ import re
 
 from PIL import Image
 
-from .backend import ChatClient, image_part, map_concurrent, text_part
+from .backend import (ChatClient, ServerError, Stopped, check_stop, image_part,
+                      map_concurrent, text_part)
 from .review import crop
 from .schema import Block, Page, page_stem
 from .tikz import check_tikzcd, graph_markdown, normalise, parse_graph
@@ -155,41 +156,64 @@ def crop_figures(pages: list[Page], doc_dir: str, pad: float = 0.005) -> None:
             b.meta.setdefault("alt", f"Figure (page {p.index + 1})")
 
 
-def describe_figures(client: ChatClient, pages: list[Page], model_tag: str,
-                     workers: int = 8, repair: int = 1) -> None:
-    """Fill meta['description'] / meta['kind'] (and meta['graph'] for graph
-    drawings) for every cropped figure. A graph or commutative diagram whose
+def needs_description(b: Block) -> bool:
+    return b.type == "figure" and bool(b.meta.get("image")) and "description" not in b.meta
+
+
+def describe_figure(client: ChatClient, page: Page, k: int, model_tag: str,
+                    repair: int = 1) -> Block:
+    """Describe figure block ``k`` of ``page`` (meta['description'], ['kind'],
+    and ['graph'] for graph drawings). A graph or commutative diagram whose
     TikZ fails the checks is sent back ``repair`` times with the problems;
-    the last answer is kept either way, and remaining problems become flags."""
-    work = []
-    for p in pages:
-        for k, b in enumerate(p.blocks):
-            if b.type == "figure" and b.meta.get("image") and "description" not in b.meta:
-                work.append((p, k, b))
+    the last answer is kept either way, and remaining problems become flags.
 
-    def one(item):
-        p, k, b = item
-        path = os.path.join(os.path.dirname(os.path.dirname(p.image)), b.meta["image"])
-        with Image.open(path) as im:
-            fig = im.convert("RGB")
-        base = DESCRIBE_PROMPT.replace("<<CAPTION>>", caption_for(p.blocks, k).replace('"', "'"))
-        prompt = base
-        for attempt in range(repair + 1):
-            info = parse_description(client.chat([image_part(fig), text_part(prompt)],
-                                                 max_tokens=4096))
-            info, flags, problems = check_structure(info)
-            if not flags or attempt == repair:
-                break
-            prompt = base + REPAIR_SUFFIX.replace("<<PROBLEMS>>", "\n".join(
-                f"- {x}" for x in problems)).replace("<<PREVIOUS>>", info["structure"])
-        b.meta["kind"] = info["kind"]
-        b.meta["description"] = format_description(info)
-        b.meta["description_source"] = model_tag
-        b.meta["describe_attempts"] = attempt + 1
-        if "graph" in info:
-            b.meta["graph"] = info["graph"]
-        b.flags = sorted(set(b.flags) | set(flags))
+    Same failure contract as review.review_block: Stopped and ServerError
+    propagate (the page is not saved); any other error is recorded on the
+    block as final, so it cannot keep the page from completing."""
+    check_stop()
+    b = page.blocks[k]
+    try:
+        _describe(client, page, k, b, model_tag, repair)
+    except (Stopped, ServerError):
+        raise
+    except Exception as e:      # noqa: BLE001 — recorded, not swallowed
+        b.history.append({"source": model_tag, "decision": f"describe error: {e!r}"})
+        b.meta["description_error"] = repr(e)[:300]
+    return b
 
-    for (p, k, b), r in zip(work, map_concurrent(one, work, workers)):
-        if isinstance(r, Exception):
-            b.history.append({"source": model_tag, "decision": f"describe error: {r!r}"})
+
+def _describe(client, page, k, b, model_tag, repair):
+    path = os.path.join(os.path.dirname(os.path.dirname(page.image)), b.meta["image"])
+    with Image.open(path) as im:
+        fig = im.convert("RGB")
+    base = DESCRIBE_PROMPT.replace("<<CAPTION>>", caption_for(page.blocks, k).replace('"', "'"))
+    prompt = base
+    for attempt in range(repair + 1):
+        if attempt:
+            check_stop()
+        info = parse_description(client.chat([image_part(fig), text_part(prompt)],
+                                             max_tokens=4096))
+        info, flags, problems = check_structure(info)
+        if not flags or attempt == repair:
+            break
+        prompt = base + REPAIR_SUFFIX.replace("<<PROBLEMS>>", "\n".join(
+            f"- {x}" for x in problems)).replace("<<PREVIOUS>>", info["structure"])
+    b.meta["kind"] = info["kind"]
+    b.meta["description"] = format_description(info)
+    b.meta["description_source"] = model_tag
+    b.meta["describe_attempts"] = attempt + 1
+    if "graph" in info:
+        b.meta["graph"] = info["graph"]
+    b.flags = sorted(set(b.flags) | set(flags))
+
+
+def describe_figures(client: ChatClient, pages: list[Page], model_tag: str,
+                     workers: int = 8, repair: int = 1) -> set[int]:
+    """Describe every figure of these pages that has a crop and no
+    description yet (library helper; the CLI pools figures with block reviews
+    across the shard). Returns the indices of pages left INCOMPLETE."""
+    work = [(p, k) for p in pages for k, b in enumerate(p.blocks) if needs_description(b)]
+    results = map_concurrent(lambda pk: describe_figure(client, pk[0], pk[1], model_tag,
+                                                        repair), work, workers)
+    return {p.index for (p, _), r in zip(work, results)
+            if isinstance(r, (Stopped, ServerError))}

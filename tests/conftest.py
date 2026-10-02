@@ -63,9 +63,12 @@ class FakeServer:
             prompt = "\n".join(p["text"] for p in content if p["type"] == "text")
             n_img = sum(p["type"] == "image_url" for p in content)
         out = self.responder(prompt, n_img)
+        if isinstance(out, httpx.Response):     # a scripted error status
+            return out
         text, finish = out if isinstance(out, tuple) else (out, "stop")
         return httpx.Response(200, json=chat_reply(text, finish))
 
-    def client(self) -> ChatClient:
-        return ChatClient("http://fake:8000", transport=httpx.MockTransport(self.handler),
-                          max_retries=0)
+    def client(self, **kw) -> ChatClient:
+        kw.setdefault("max_retries", 0)
+        kw.setdefault("backoff", 0.0)
+        return ChatClient("http://fake:8000", transport=httpx.MockTransport(self.handler), **kw)

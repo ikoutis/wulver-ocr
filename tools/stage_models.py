@@ -10,10 +10,11 @@ $WOCR_MODELS/<NAME> (default /project/ikoutis/wocr_models). Weights go to
 never contain dots — some trust-remote-code models (dots.ocr among them)
 break when their directory name is not a valid Python module name.
 
-Where to run: the dml convention is a login node (no GPU needed). Large
-downloads can hit the login node's per-user limits; if so, run it in an
-interactive CPU session (compute nodes reach Hugging Face too). Gated repos
-need `huggingface-cli login` (or HF_TOKEN) first.
+Where to run: the dml convention is a login node (no GPU needed), with the
+conda env activated in your shell (the command is in tools/setup_env.sh's
+header). Large downloads can hit the login node's per-user limits; if so, run
+it in an interactive CPU session (compute nodes reach Hugging Face too).
+Gated repos need `huggingface-cli login` (or HF_TOKEN) first.
 """
 
 from __future__ import annotations
@@ -31,10 +32,12 @@ def read_profile(name: str) -> dict:
     if not os.path.exists(path):
         sys.exit(f"no profile {path}")
     out = {}
-    for line in open(path, encoding="utf-8"):
-        m = re.match(r'^\s*(?:export\s+)?([A-Z_]+)=["\']?([^"\'\s#(]*)["\']?\s*(#.*)?$', line)
-        if m:
-            out[m.group(1)] = m.group(2)
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r'^\s*(?:export\s+)?([A-Z_]+)=["\']?([^"\'\s#(]*)["\']?\s*(#.*)?$',
+                         line)
+            if m:
+                out[m.group(1)] = m.group(2)
     return out
 
 
@@ -61,7 +64,11 @@ def main(argv=None):
         print(f"[*] {role.lower()}: {repo}{'@' + rev if rev else ''} -> {dst}")
         if args.dry_run:
             continue
-        from huggingface_hub import snapshot_download
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            sys.exit("huggingface_hub is not installed in this python: activate the env "
+                     "first (the command is in tools/setup_env.sh's header)")
         snapshot_download(repo_id=repo, revision=rev, local_dir=dst)
     print("[*] done" + (" (dry run)" if args.dry_run else ""))
 

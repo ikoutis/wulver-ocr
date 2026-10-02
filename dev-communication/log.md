@@ -53,7 +53,10 @@ scale. It also replaces the throughput guesses in `design.md` §5 with measureme
 
 ```bash
 bash tools/setup_env.sh                                  # login node; ~15 min
-# GPU check: the srun one-liner in tools/setup_env.sh's header (debug_gpu, free).
+module load Miniforge3 && source "$(conda info --base)/etc/profile.d/conda.sh" \
+    && conda activate /project/ikoutis/conda_env/wocr    # the env, in your own shell
+srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1 \
+    --time=00:10:00 bash -l tools/setup_env.sh --gpu-check   # GPU check (free)
 # Paste its output. The driver's max CUDA version decides the vLLM wheel.
 python tools/stage_models.py --profile default           # ~65 GB to /project/ikoutis/wocr_models
 pytest tests/                                            # CPU, seconds
@@ -71,16 +74,21 @@ OUT=/project/ikoutis/$USER/wocr/runs/o002_smoke \
 1. The `nvidia-smi` line printed at the top of `logs/wocr_<job>_0.log`, plus torch, CUDA, and
    vLLM versions (from `/project/ikoutis/conda_env/wocr/wocr.lock.txt`), and whether
    `setup_env.sh`'s sanity line said `katex check: True`.
-2. Server start-up times (`=== reader ready after …s`) and the `read:`/`review` summary lines
-   (pages, seconds, review decisions).
+2. Server start-up times (the `=== chandra_ocr_2 ready after …s on 127.0.0.1:<port> ===` line,
+   and the same for `qwen3_8_27b`) and the `read:`/`review:` summary lines (pages saved,
+   seconds, review decisions).
 3. For each paper, `report.json`'s `review` and `open_flags` counts. Also a look at the Markdown
    next to the PDF: which formulas are wrong, whether the reading order is right on two-column
    pages, and whether figures were cropped and described sensibly.
 4. Any traceback in `logs/*.err` or the `logs/vllm_*.log` files. If a server failed to start,
    the last 40 lines of its log are copied into the `.err`.
 5. If the reviewer (Qwen3.8-27B, a hybrid-attention model) fails to start or misbehaves on the
-   A100s, rerun the same three papers with `WOCR_PROFILE=conservative` (dots.mocr +
-   Qwen3-VL-32B). Report both runs. That is also a first, informal reader comparison.
+   A100s, stage the conservative pair (`python tools/stage_models.py --profile conservative`)
+   and rerun the same three papers with `WOCR_PROFILE=conservative` (dots.mocr +
+   Qwen3-VL-32B) and `OUT=/project/ikoutis/$USER/wocr/runs/o002_smoke_conservative`. The
+   default `WORK` is per profile, so this run reads the pages again with dots.mocr instead
+   of reusing Chandra's reading. Report both runs. That is also a first, informal reader
+   comparison.
 
 No numbers are expected to be final here. The point is that the plumbing works with the real
 models, and a list of what to fix before M2.

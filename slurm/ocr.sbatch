@@ -107,9 +107,17 @@ if [ ! -f "$(dirname "$0")/serve_lib.sh" ] && [ "${WOCR_LOGIN_PROFILE:-1}" != 0 
 fi
 module load Miniforge3
 source "$(conda info --base)/etc/profile.d/conda.sh"
+WOCR_CONDA_ENV="${WOCR_CONDA_ENV:-/project/ikoutis/conda_env/wocr}"
 set +u
-conda activate "${WOCR_CONDA_ENV:-/project/ikoutis/conda_env/wocr}"
+conda activate "$WOCR_CONDA_ENV"
 set -u
+# The env's own C++ runtime first. The env's python finds it through its
+# RUNPATH, but a console script such as `vllm` resolves extension modules
+# against the loader's default path, where the nodes' older /lib64
+# libstdc++ wins (ICU 78, pulled in by nodejs, needs CXXABI_1.3.15):
+# "ImportError: /lib64/libstdc++.so.6: version CXXABI_1.3.15 not found"
+# in every server start, seen in [O-002].
+export LD_LIBRARY_PATH="$WOCR_CONDA_ENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Where this was started, and the repo. `bash slurm/ocr.sbatch` runs this
 # file in place, from anywhere (in an `interactive` session SLURM_SUBMIT_DIR

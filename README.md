@@ -67,12 +67,27 @@ pytest tests/
 Wulver (once; follows the dml repo's conventions):
 
 ```bash
+# first: keep conda/pip/uv/HF caches off the 50 GB $HOME (they fill it fast)
+mkdir -p /project/ikoutis/conda_pkgs /project/ikoutis/$USER/cache
+printf 'pkgs_dirs:\n  - /project/ikoutis/conda_pkgs\n' >> ~/.condarc
+cat >> ~/.bashrc <<'EOF'
+export PIP_CACHE_DIR=/project/ikoutis/$USER/cache/pip
+export UV_CACHE_DIR=/project/ikoutis/$USER/cache/uv
+export HF_HOME=/project/ikoutis/$USER/cache/huggingface
+EOF
+source ~/.bashrc
 bash tools/setup_env.sh                          # conda env at /project/ikoutis/conda_env/wocr (+ vLLM, KaTeX)
 module load Miniforge3 && source "$(conda info --base)/etc/profile.d/conda.sh" \
     && conda activate /project/ikoutis/conda_env/wocr
 srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1 \
     --time=00:10:00 bash -l tools/setup_env.sh --gpu-check   # does the A100 run this vLLM?
-python tools/stage_models.py --profile default   # ~65 GB of weights → /project/ikoutis/wocr_models
+# ~65 GB of weights → /project/ikoutis/wocr_models, as a CPU batch job (the login
+# node's per-user limits can kill a download this size; the job resumes if cut off)
+sbatch --job-name=wocr_stage --partition=general --qos=low --account=ikoutis \
+       --cpus-per-task=4 --mem=16G --time=06:00:00 --output=logs/stage_%j.log \
+       --wrap "module load Miniforge3 && source \$(conda info --base)/etc/profile.d/conda.sh \
+               && conda activate /project/ikoutis/conda_env/wocr && cd $PWD \
+               && python tools/stage_models.py --profile default"
 ```
 
 vLLM is pinned to a tested release (`WOCR_VLLM_SPEC`, default `vllm==0.30.0`).

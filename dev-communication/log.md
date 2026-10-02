@@ -11,6 +11,40 @@ the entry it answers.
 
 ---
 
+## 2026-10-02 — Ioannis / Claude: [O-002] first contact with Wulver — three environment problems, then the servers start
+
+The set-up steps of [O-002] were run on Wulver today. The GPU nodes have driver 580.159.04
+(CUDA 13.0), so the default CUDA 13 build of vLLM 0.30.0 is the right one; the `--gpu-check`
+confirmed it. Three things stood in the way before the first model server started, none of
+them in the pipeline itself:
+
+1. **A full home directory.** `conda create` crashed with an unhelpful report because `$HOME`
+   was at its 50 GB quota (26 GB of old conda package caches, 16 GB of `~/.cache`). Caches now
+   live on `/project`: `pkgs_dirs` in `~/.condarc`, and `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
+   `HF_HOME` in `~/.bashrc`. The README's install section says so.
+2. **Weights on the login node.** 65 GB through the login node's per-user limits is a kill
+   waiting to happen; a CPU batch job (`sbatch --wrap` on `general`/`low`) did it instead, and
+   `snapshot_download` resumes if interrupted.
+3. **The C++ runtime.** Every server start died with
+   `libstdc++.so.6: version CXXABI_1.3.15 not found (required by libicui18n.so.78)`. The
+   `nodejs` that `setup_env.sh` installs for KaTeX brings ICU 78, which needs a newer C++
+   runtime than the nodes' RHEL 9 `/lib64` (GCC 11). The env's own `python` finds the env's
+   `libstdc++` through its RUNPATH, so `python -c "import sqlite3"` and the GPU check passed
+   on the login node, on `debug_gpu`, and in a batch job. The `vllm` console script does not:
+   its extension modules resolve against the loader's default path, where `/lib64` wins.
+   This took four diagnostic jobs to isolate, because the GPU check tested `python`, not
+   `vllm`. Fixed three ways: `setup_env.sh` installs `libstdcxx-ng` with `nodejs`;
+   `ocr.sbatch` puts the env's `lib` first on `LD_LIBRARY_PATH` after activation (this
+   alone fixed it, confirmed on a `debug_gpu` job); and `--gpu-check` now runs the `vllm`
+   command itself.
+
+The smoke run is resubmitted with the fix. Its inputs are the two public samples now in
+`samples/` (a born-digital IEEE paper with numbered equations; a 19th-century book scan) and a
+handwritten quiz with graph drawings that stays on `/project`. Results follow in the next
+entry.
+
+---
+
 ## 2026-10-02 — Note [O-006]: a third pass over the fixes — 21 more findings fixed
 
 A third independent pass checked the [O-005] fixes against the merged code, again with a

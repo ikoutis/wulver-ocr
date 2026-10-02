@@ -73,6 +73,7 @@ if [ "${1:-}" = --gpu-check ]; then
     set +u
     conda activate "$ENV_PREFIX"
     set -u
+    export LD_LIBRARY_PATH="$ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"  # as ocr.sbatch
     nvidia-smi || echo "[!] nvidia-smi failed: no GPU or no driver on this node"
     DRIVER=$(driver_version)
     INSTALLED=$(cat "$ENV_PREFIX/wocr.flavour" 2>/dev/null || echo unknown)
@@ -119,6 +120,17 @@ if failed:
 else:
     print("vllm ops: " + (", ".join(ops) + " load" if ops else "none found"))
 EOF
+    # What a job actually runs is the `vllm` console script, not `python -c`:
+    # it resolves C++ runtimes differently (see ocr.sbatch), so test it as is.
+    CLI_ERR=$(mktemp)
+    if vllm --help >/dev/null 2>"$CLI_ERR"; then
+        echo "vllm cli: starts"
+    else
+        echo "vllm cli: FAILED to start:"; tail -n 3 "$CLI_ERR"
+        echo "[!] every model server would fail the same way; see the C++ runtime"
+        echo "    note in tools/setup_env.sh (libstdcxx-ng) and ocr.sbatch (LD_LIBRARY_PATH)"
+    fi
+    rm -f "$CLI_ERR"
     exit 0
 fi
 
@@ -191,8 +203,12 @@ echo "$FLAVOUR" > "$ENV_PREFIX/wocr.flavour"
 uv pip install --no-cache -r requirements.txt
 
 # KaTeX for the formula validator (src/katex_check.py); optional — the
-# pipeline skips the check if this step fails.
-if conda install -y -q -c conda-forge nodejs >/dev/null; then
+# pipeline skips the check if this step fails. nodejs brings a recent ICU,
+# which needs a newer C++ runtime than the nodes' /lib64 has (RHEL 9:
+# GCC 11): install the env's own libstdc++ with it, and ocr.sbatch puts it
+# first on the loader path. Without that, `vllm` dies at start-up with
+# "libstdc++.so.6: version CXXABI_1.3.15 not found" ([O-002]).
+if conda install -y -q -c conda-forge nodejs "libstdcxx-ng>=14" "libgcc-ng>=14" >/dev/null; then
     mkdir -p "$ENV_PREFIX/share/wocr-katex"
     npm install --silent --no-audit --no-fund --prefix "$ENV_PREFIX/share/wocr-katex" katex \
         || echo "[!] katex install failed — formula KaTeX check disabled"

@@ -130,3 +130,28 @@ class TestKatex:
     def test_flag_in_validator(self):
         assert "latex_katex" in validate_block(Block(type="formula", content=r"\fraq{a}{b}"))
         assert "latex_katex" in validate_block(Block(type="text", content=r"see $\fraq{a}{b}$"))
+
+    def test_worker_restarted_after_it_dies(self, capsys):
+        from src import katex_check
+        old = katex_check._SERVER._proc
+        old.kill()
+        old.wait()
+        assert katex_error(r"\fraq{a}{b}") is not None     # asked again, of a new worker
+        assert katex_error(r"\frac{a}{b}") is None
+        assert katex_check._SERVER._proc is not old
+        assert "restarting" in capsys.readouterr().err
+
+    def test_display_math_in_a_paragraph(self):
+        text = ("Let $x$ satisfy\n\n$$\n\\sum x_i = 1 \\tag{3}\n$$\n\n"
+                "where Smith & Jones's $x_i \\ge 0$ for all $i$.")
+        assert validate_block(Block(type="text", content=text)) == []
+
+    def test_gate(self):
+        from src.review import ReviewPolicy, gate
+        b = Block(type="formula", content=r"\mbox{for all } x: \frac{a}{b \leq 1")
+        b.flags = validate_block(b)
+        assert b.flags == ["latex_braces"]          # KaTeX knows no \mbox either
+        assert gate(b, r"\mbox{for all } x: \frac{a}{b} \leq 1", ReviewPolicy())[0]
+        b = Block(type="formula", content=r"\begin{aligned} a &= b \\ &= c \end{aligned}")
+        b.flags = validate_block(b)
+        assert gate(b, r"\begin{aligned} a &= b \\{}&= c \end{aligned}", ReviewPolicy())[0]

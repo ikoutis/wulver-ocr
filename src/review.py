@@ -16,6 +16,10 @@ image crop plus the reader's draft — and its proposal is accepted only if
      in which case the reviewer is the fallback reader for that block.
 Rejected proposals are kept in the block's history, so the gate's decisions
 are auditable and its thresholds tunable from data (see design.md §Eval).
+An empty draft (such as the tail block a reader adds for output lost at a
+max_tokens cut) has nothing to proofread, so the reviewer is asked to
+transcribe its crop instead. The truncation marker is never shown to the
+reviewer, and a proposal containing it is never accepted.
 
 Which blocks are reviewed is a policy: every block with a validator flag, plus
 every block whose type is in ``review_types`` (formulas by default — the
@@ -32,12 +36,16 @@ from typing import Optional
 
 from PIL import Image
 
-from .backend import (ChatClient, ServerError, Stopped, check_stop, image_part,
-                      map_concurrent, text_part)
+from .backend import (TRUNCATION_MARKER, ChatClient, ServerError, Stopped, check_stop,
+                      image_part, map_concurrent, text_part)
 from .schema import Block, Page
 from .validate import strip_math_delims, validate_block
 
 DEGENERATE = {"empty", "repetition", "truncated"}
+# check_latex runs KaTeX only on structurally sound LaTeX, so a draft with one
+# of these flags was never KaTeX-checked (see gate).
+_STRUCTURAL = {"latex_braces", "latex_env", "latex_leftright", "latex_delims"}
+_MARK = TRUNCATION_MARKER.strip()       # "<<TRUNCATED>>", with or without its newline
 
 _COMMON_RULES = """Rules:
 - Transcribe only what is visible in the image. Never add, complete, or summarise.
@@ -98,9 +106,41 @@ VERDICT: correct | fixed | unreadable
 }
 _OUT_TAG = {"formula": "latex", "table": "table_out", "text": "text"}
 
+# For an empty draft: the reviewer is the fallback reader of the crop.
+_TRANSCRIBE = """You are transcribing part of a scanned research paper.
+The OCR reader produced no text for the region of the page shown in the image.
+Transcribe {what}.
+Rules:
+- Transcribe only what is visible in the image. Never add, complete, or summarise.
+- Leave out running headers, footers, and page numbers.
+- {form}
+- If there is nothing else to transcribe, answer VERDICT: correct with nothing inside the tags.
+
+Answer in exactly this format:
+VERDICT: fixed | correct | unreadable
+<{tag}>
+...
+</{tag}>"""
+_TRANSCRIBE_KIND = {
+    "formula": ("the display equation it shows",
+                "Return the LaTeX body only, without $ or \\[ \\] delimiters; "
+                "keep any equation number as \\tag{...}."),
+    "table": ("the table it shows",
+              "Return an HTML <table> if the table has merged cells, otherwise "
+              "Markdown; keep any math as $...$."),
+    "text": ("everything it shows, in reading order",
+             "Write Markdown, with inline math as $...$ and display math as "
+             "$$...$$ on lines of their own."),
+}
+
 
 def prompt_kind(block_type: str) -> str:
     return block_type if block_type in ("formula", "table") else "text"
+
+
+def _draft(content: str) -> str:
+    """The block content as the reviewer sees it: without the truncation marker."""
+    return content.replace(TRUNCATION_MARKER, "").replace(_MARK, "").strip()
 
 
 @dataclass
@@ -114,7 +154,12 @@ class ReviewPolicy:
     def wants(self, b: Block) -> bool:
         if b.type in ("figure", "header", "footer", "page_number"):
             return False
-        return (self.flagged and bool(b.flags)) or b.type in self.review_types
+        if "page_failed" in b.flags:    # a failed page's placeholder: re-read, not reviewed
+            return False
+        # "latex_unchecked" alone is no reason to review: it says only that
+        # KaTeX was down when the block was read (_review_block re-checks).
+        flagged = bool(set(b.flags) - {"latex_unchecked"})
+        return (self.flagged and flagged) or b.type in self.review_types
 
 
 def crop(img: Image.Image, bbox: Optional[list[float]], pad: float) -> Image.Image:
@@ -130,13 +175,31 @@ def crop(img: Image.Image, bbox: Optional[list[float]], pad: float) -> Image.Ima
     return img.crop(box)
 
 
-def parse_reply(reply: str, kind: str) -> tuple[str, Optional[str]]:
-    """-> (verdict, content or None). Tolerates missing closing tags."""
-    m = re.search(r"VERDICT:\s*(correct|fixed|unreadable)", reply, re.I)
+_FENCE = re.compile(r"```[^\n`]*\n(.*?)\n?```", re.S)
+
+
+def _unfence(s: str) -> str:
+    """'```latex\\nx\\n```' -> 'x': one code fence around a whole answer."""
+    m = _FENCE.fullmatch(s.strip())
+    return m.group(1).strip() if m and "```" not in m.group(1) else s
+
+
+def parse_reply(reply: str, kind: str, draft: str = "") -> tuple[str, Optional[str]]:
+    """-> (verdict, content or None). Tolerates missing closing tags, a
+    verdict in Markdown emphasis ("**VERDICT:** fixed"), and an answer in a
+    code fence, inside the tags or in place of them: the fence is dropped,
+    unless the draft itself is one fenced block."""
+    m = re.search(r"VERDICT\W*:\W*(correct|fixed|unreadable)", reply, re.I)
     verdict = m.group(1).lower() if m else "fixed"
     tag = _OUT_TAG[kind]
     m = re.search(rf"<{tag}>\s*\n?(.*?)\n?\s*(?:</{tag}>|$)", reply, re.S)
-    content = m.group(1).strip() if m else None
+    if m:
+        content = m.group(1).strip()
+    else:
+        fences = list(_FENCE.finditer(reply))
+        content = fences[-1].group(0).strip() if fences else None
+    if content is not None and _unfence(draft) == draft:
+        content = _unfence(content)
     if content is not None and kind == "formula":
         content = strip_math_delims(content)
     return verdict, content
@@ -151,16 +214,24 @@ def gate(block: Block, proposal: str, policy: ReviewPolicy) -> tuple[bool, str]:
     """Decide whether the reviewer's proposal replaces the block content."""
     if not proposal.strip():
         return False, "empty proposal"
+    if _MARK in proposal:           # the reviewer's reply was cut off, or echoed the marker
+        return False, "truncated proposal"
     trial = Block(type=block.type, content=proposal)
     new_flags = set(validate_block(trial))
     old_flags = set(block.flags)
     added = new_flags - old_flags
+    if old_flags & _STRUCTURAL:
+        # The draft's KaTeX status was never computed, so a proposal that
+        # fixes its structure does not "add" a KaTeX flag.
+        added -= {"latex_katex", "latex_unchecked"}
     if added:
         return False, f"introduces flags {sorted(added)}"
     if old_flags & DEGENERATE:
         return True, "draft degenerate; reviewer re-read accepted"
-    limit = policy.max_change_flagged if old_flags else policy.max_change
-    frac = change_fraction(block.content, proposal)
+    # latex_unchecked says nothing against the draft: it keeps the tight bound
+    limit = (policy.max_change_flagged if old_flags - {"latex_unchecked"}
+             else policy.max_change)
+    frac = change_fraction(_draft(block.content), proposal)
     if frac > limit:
         return False, f"change {frac:.2f} > limit {limit:.2f}"
     return True, f"change {frac:.2f}"
@@ -188,27 +259,37 @@ def review_block(client: ChatClient, page_img: Image.Image, block: Block,
 
 def _review_block(client: ChatClient, page_img: Image.Image, block: Block,
                   policy: ReviewPolicy, model_tag: str) -> Block:
+    if "latex_unchecked" in block.flags:
+        # KaTeX was down when the block was read: check the draft now, so the
+        # reviewer is told its real problems and the gate compares against them.
+        block.flags = sorted((set(block.flags) - {"latex_unchecked"})
+                             | set(validate_block(block)))
     kind = prompt_kind(block.type)
-    issues = (f"\nAutomatic checks flagged: {', '.join(block.flags)}.\n"
-              if block.flags else "\n")
-    prompt = _PROMPTS[kind].format(draft=block.content, issues=issues,
-                                   rules=_COMMON_RULES)
+    draft = _draft(block.content)
+    if draft:
+        issues = (f"\nAutomatic checks flagged: {', '.join(block.flags)}.\n"
+                  if block.flags else "\n")
+        prompt = _PROMPTS[kind].format(draft=draft, issues=issues, rules=_COMMON_RULES)
+    else:
+        what, form = _TRANSCRIBE_KIND[kind]
+        prompt = _TRANSCRIBE.format(what=what, form=form, tag=_OUT_TAG[kind])
     reply = client.chat([image_part(crop(page_img, block.bbox, policy.pad)),
                          text_part(prompt)], max_tokens=4096)
-    verdict, proposal = parse_reply(reply, kind)
+    verdict, proposal = parse_reply(reply, kind, draft)
     record = {"source": model_tag, "verdict": verdict}
 
-    if verdict == "correct" or proposal is None or proposal == block.content:
-        record["decision"] = "kept (reviewer agreed)" if verdict == "correct" \
-            else "kept (no usable proposal)"
-        block.history.append(record)
-        block.meta["reviewed"] = "agreed" if verdict == "correct" else "no-proposal"
-        return block
-    if verdict == "unreadable":
+    if verdict == "unreadable":     # whatever came with it: a human should look
         record["decision"] = "kept (reviewer: unreadable)"
         block.history.append(record)
         block.flags = sorted(set(block.flags) | {"unreadable"})
         block.meta["reviewed"] = "unreadable"
+        return block
+    # "correct" keeps a draft; for an empty draft a transcription still counts
+    if proposal is None or proposal == draft or (verdict == "correct" and draft):
+        record["decision"] = "kept (reviewer agreed)" if verdict == "correct" \
+            else "kept (no usable proposal)"
+        block.history.append(record)
+        block.meta["reviewed"] = "agreed" if verdict == "correct" else "no-proposal"
         return block
 
     ok, why = gate(block, proposal, policy)

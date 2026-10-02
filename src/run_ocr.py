@@ -112,7 +112,8 @@ def select_docs(args) -> list[str]:
         for p in paths:
             check_stop()
             try:
-                ids.append(ing.ingest(p, args.work, dpi=args.dpi)["doc_id"])
+                ids.append(ing.ingest(p, args.work, dpi=args.dpi,
+                                      force=args.force and args.cmd == "ingest")["doc_id"])
             except Exception as e:      # noqa: BLE001 — a corrupt file is marked, loudly
                 log(f"INGEST ERROR {p}: {e!r}")
                 _mark_ingest_failed(args, p, e)

@@ -3,9 +3,9 @@
 For models whose native output is one Markdown document per page — olmOCR
 (the ``olmocr`` reader, with olmOCR's own prompt), or any general VLM prompted
 to transcribe a page (``markdown``). The Markdown is split back into blocks
-(headings, display math, tables, paragraphs) so that the validators and the
-per-block review still apply; without boxes the reviewer sees the whole page
-for each block, and figures cannot be cropped.
+(the '#' title, headings, display math, tables, paragraphs) so that the
+validators and the per-block review still apply; without boxes the reviewer
+sees the whole page for each block, and figures cannot be cropped.
 
 A reply cut off at max_tokens keeps its complete blocks; the line and the
 block in progress at the cut are dropped, and a truncated_tail block (base.py)
@@ -121,8 +121,10 @@ def split_markdown(md: str, truncated: bool = False) -> list[Block]:
         elif _HEADING.match(s):
             flush()
             hashes, title = _HEADING.match(s).groups()
-            blocks.append(Block(type="heading", content=title.strip(),
-                                meta={"level": max(1, len(hashes) - 1)}))
+            # '#' is the title, '##' a top-level section (level 1), as dots
+            blocks.append(Block(type="title", content=title.strip()) if len(hashes) == 1
+                          else Block(type="heading", content=title.strip(),
+                                     meta={"level": len(hashes) - 1}))
         elif _FIGURE.match(s):
             flush()
             alt = _FIGURE.match(s).group(1).strip()
@@ -170,7 +172,7 @@ class PageMarkdownReader(Reader):
         body, _ = strip_front_matter(strip_outer_fence(reply.replace(TRUNCATION_MARKER, "")))
         blocks = split_markdown(body, truncated)
         if truncated:
-            blocks.append(truncated_tail(blocks, self.tag))
+            blocks.extend(truncated_tail(blocks, self.tag))
         for b in blocks:
             b.source = self.tag
         return blocks
@@ -190,22 +192,75 @@ OLMOCR_PROMPT = (
 )
 # olmocr/pipeline.py: TEMPERATURE_BY_ATTEMPT (a retry samples hotter)
 OLMOCR_TEMPERATURES = (0.1, 0.1, 0.2, 0.3, 0.5, 0.8, 0.9, 1.0)
-_INLINE_PARENS = re.compile(r"\\\(\s*(\S.*?)\s*\\\)")
+# Inline math \( … \), within one paragraph.
+_INLINE_PARENS = re.compile(r"\\\(\s*(\S(?:(?!\\\(|\n\s*\n).)*?)\s*\\\)", re.S)
+# Display math \[ … \] (olmOCR was trained on text whose $$ … $$ became this,
+# wherever it stood), and what a Markdown-escaped citation holds instead:
+# \[1\], \[1, 2\], \[Spi04\].
+_DISPLAY_BRACKETS = re.compile(r"\\\[((?:(?!\\\[).)*?)\\\]", re.S)
+_CITATION = re.compile(r"[\w\s,.;:'&\-–]+")
+_TABLE = re.compile(r"(<table\b.*?</table>)", re.S | re.I)
+_TURN = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
+         270: Image.Transpose.ROTATE_270}
+
+
+def _lift_display(md: str) -> str:
+    """Display math \\[ … \\] sharing a line with text -> $$ lines of its own,
+    so that split_markdown makes it a formula block (outside tables)."""
+    def lift(part: str) -> str:
+        def sub(m: re.Match) -> str:
+            before = part[part.rfind("\n", 0, m.start()) + 1:m.start()]
+            end = part.find("\n", m.end())
+            after = part[m.end():end if end >= 0 else len(part)]
+            if not (before.strip() or after.strip()) or _CITATION.fullmatch(m.group(1)):
+                return m.group(0)       # on lines of its own already, or a citation
+            return f"\n$$\n{m.group(1).strip()}\n$$\n"
+        return _DISPLAY_BRACKETS.sub(sub, part)
+    return "".join(p if k % 2 else lift(p) for k, p in enumerate(_TABLE.split(md)))
+
+
+def _rotation_asked(reply: str) -> int:
+    """The turn olmOCR's front matter asks for (is_rotation_valid: false,
+    rotation_correction: 90/180/270), else 0."""
+    _, meta = strip_front_matter(strip_outer_fence(reply))
+    turn = meta.get("rotation_correction", "")
+    if meta.get("is_rotation_valid", "").lower() != "false" or not turn.isdigit():
+        return 0
+    return int(turn) if int(turn) in _TURN else 0
 
 
 class OlmOCRReader(PageMarkdownReader):
     """olmOCR-2 (allenai/olmOCR-2-7B-1025), run as olmOCR's own pipeline runs
     it (olmocr/pipeline.py): the v4 no-anchoring YAML prompt, the text part
     before the image, the page rendered at 1288 px on its longest side, at
-    most 8000 tokens, temperature by attempt. Its reply is Markdown under
-    YAML front matter (stripped), inline math as \\(…\\) (converted to $…$
-    here), display math as \\[…\\]."""
+    most 8000 tokens, temperature by attempt, and a page the model says is
+    rotated read again turned as it asks (up to max_turns times; the blocks
+    of a turned page carry meta["rotation"]). Its reply is Markdown under
+    YAML front matter (stripped), inline math as \\(…\\) and display math as
+    \\[…\\] (converted to $…$ and $$…$$ here)."""
 
     name = "olmocr"
     target_long_side = 1288
+    max_turns = 3
 
     def __init__(self, client, max_tokens: int = 8000):
         super().__init__(client, max_tokens, prompt=OLMOCR_PROMPT)
+
+    def read(self, img: Image.Image, attempt: int = 0) -> list[Block]:
+        img, rotation = self.prepare(img), 0
+        for k in range(self.max_turns + 1):
+            # each turn is a further attempt, as in olmOCR's pipeline
+            reply = self.request(img.transpose(_TURN[rotation]) if rotation else img,
+                                 attempt + k)
+            turn = _rotation_asked(reply)
+            if not turn or k == self.max_turns:
+                break
+            rotation = (rotation + turn) % 360
+        blocks = self.parse(reply)
+        for b in blocks if rotation else ():
+            if not b.meta.get("truncated_tail"):
+                b.meta["rotation"] = rotation
+        return blocks
 
     def prepare(self, img: Image.Image) -> Image.Image:
         scale = self.target_long_side / max(img.size)     # up or down, as olmOCR renders
@@ -220,4 +275,5 @@ class OlmOCRReader(PageMarkdownReader):
             temperature=OLMOCR_TEMPERATURES[min(attempt, len(OLMOCR_TEMPERATURES) - 1)])
 
     def parse(self, reply: str) -> list[Block]:
-        return super().parse(_INLINE_PARENS.sub(lambda m: f"${m.group(1)}$", reply))
+        reply = _INLINE_PARENS.sub(lambda m: "$" + " ".join(m.group(1).split()) + "$", reply)
+        return super().parse(_lift_display(reply))

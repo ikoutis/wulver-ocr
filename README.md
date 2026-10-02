@@ -82,7 +82,8 @@ driver to look at, so there the CUDA 13 build is installed with a warning,
 and `--gpu-check` on a GPU node says whether that node's driver runs it. It
 also loads vLLM's compiled kernels, so a mismatch shows up there rather than
 in the first job. If the driver is too old, it prints the reinstall command
-(a fresh env with `WOCR_TORCH_BACKEND=cu129`).
+(a fresh env with `WOCR_TORCH_BACKEND=cu129`). A release has no other CUDA 12
+build, so `cu129` is also the one for a 570-series driver.
 
 ## Running
 
@@ -113,9 +114,11 @@ paths name the same files.)
 
 A document counts as done once its Markdown is in `$OUT`. `$OUT` is the
 completion record: `/scratch` deletes files after 30 days, and a resubmitted
-shard does not read again a finished document whose `$WORK` is gone (unless
-`--force`). So a rerun with another profile needs its own `OUT`, as every run
-should have.
+shard does not read again a finished document whose `$WORK` is gone or has
+lost page images (unless `READ_ARGS=--force`; a `REVIEW_ARGS=--force` leaves
+it alone). So a rerun with another profile needs its own `OUT`, as every run
+should have: in another profile's `OUT` it finds everything done, and its log
+says so.
 
 Pages the reader could not read are assembled as marked gaps and listed in
 `report.json` (`failed_pages`). Their documents count as done, so the line
@@ -144,12 +147,13 @@ Batch settings are environment variables read by `slurm/ocr.sbatch`:
 
 | variable | meaning |
 |---|---|
-| `INPUTS` | documents: dirs, files, or `@listfile`, space-separated (required) |
+| `INPUTS` | documents: dirs, files, or `@listfile` (one path per line; folders in it are walked too), space-separated (required) |
 | `OUT`, `WORK` | output root (Markdown) and work root (page images, JSON); `WORK` defaults to a per-profile directory on `/scratch` |
 | `WOCR_PROFILE` | model pair: `default` (Chandra 2 + Qwen3.8-27B), `dots` (MIT reader), `conservative` (most mature on A100), `olmocr` (olmOCR-2 baseline) |
 | `PHASES` | subset of `read review assemble`, e.g. `PHASES="read assemble"` runs the reader only |
-| `READ_ARGS`, `REVIEW_ARGS` | extra flags for the read / review stage, e.g. `READ_ARGS="--retry-failed"`, `REVIEW_ARGS="--review-types formula,table"`. They apply to the pages a stage still has to do; `--force` redoes the finished ones too, at every start of the task (a requeued start included) |
+| `READ_ARGS`, `REVIEW_ARGS` | extra flags for the read / review stage, e.g. `READ_ARGS="--retry-failed"`, `REVIEW_ARGS="--review-types formula,table"`. They apply to the pages a stage still has to do; `--force` redoes the finished ones too, at every start of the task (a requeued start included). A finished document whose `WORK` was purged is redone only by `READ_ARGS=--force` |
 | `NSHARDS` | total shard count when resubmitting a subset of array indices |
+| `WOCR_LOGIN_PROFILE` | what a batch task loads as its login environment once its USR1 trap is set: `1` (default) `/etc/profile` and your `~/.bash_profile` (or `~/.bash_login`, `~/.profile`), as `bash -l` would; `0` nothing; or a file to load instead |
 
 Stage by stage, against servers you started yourself (any OpenAI-compatible
 endpoint works):
@@ -164,20 +168,23 @@ python -m src.run_ocr status   --work work --out out
 
 Useful stage flags (pass them through `READ_ARGS` / `REVIEW_ARGS` in batch):
 
-- read: `--retries 1` (re-reads of a page whose output looped, was cut off, or failed) and `--retry-failed` (re-read pages saved as failed placeholders);
+- read: `--retries 1` (re-reads of a page whose output looped, repeated an element, was cut off, or failed; the attempt that lost least of the page is kept) and `--retry-failed` (re-read pages saved as failed placeholders);
 - review: `--review-types formula,table` (review all tables too), `--no-flagged`, `--max-change 0.35`, and `--no-describe-figures`.
 
 **When things fail.** A page the reader cannot read is retried once, then
 saved as a placeholder flagged `page_failed`, so its document still
 assembles (report.json lists it; `--retry-failed` above reads it again). An
 input file that cannot be opened (corrupt, unsupported) gets
-`$OUT/<doc_id>/FAILED.json`. A review request the server rejects becomes that
-block's final decision. If a model server dies, nothing unfinished is saved
-as done: the stage exits with code 3 and the next submission picks up where
-it stopped. The same holds when the system fails during ingest (disk full,
-quota, an I/O error): nothing is marked failed, and the stage exits 3. On
-preemption or the wall clock the stage exits 85 after saving every finished
-page, and the task requeues itself.
+`$OUT/<doc_id>/FAILED.json`. One that cannot be read at all (missing,
+damaged, no permission) is skipped with a warning, and `tools/incomplete.py`
+skips it too. A review request the server rejects becomes that block's final
+decision. If a model server dies, nothing unfinished is saved as done: the
+stage exits with code 3 and the next submission picks up where it stopped.
+The same holds when the system fails during ingest (disk full, quota, a
+failed write), or when a page image vanishes from `$WORK` while the reader
+runs: nothing is marked failed, and the stage exits 3 (the next run renders
+lost page images again). On preemption or the wall clock the stage exits 85
+after saving every finished page, and the task requeues itself.
 
 ## Output
 
@@ -188,8 +195,9 @@ out/<doc_id>/
                    markdown reader); graph drawings twice, marked:
                    "Graph — Markdown (simple)" and "Graph — TikZ"
   figures/*.png    figure crops, linked from the Markdown
-  report.json      per-document summary: block types, review decisions,
-                   failed pages, truncated pages (cut-off text still
+  report.json      per-document summary: readers and the WORK it was made
+                   from, block types, review decisions, failed pages,
+                   truncated pages (cut-off text still
                    missing, and the regions the reviewer transcribed:
                    "truncated_recovered"), review errors, remaining flags
                    (where a human should look first)

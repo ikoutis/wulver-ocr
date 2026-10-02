@@ -11,6 +11,98 @@ the entry it answers.
 
 ---
 
+## 2026-10-02 — Note [O-006]: a third pass over the fixes — 21 more findings fixed
+
+A third independent pass checked the [O-005] fixes against the merged code, again with a
+skeptic reproducing each finding in a scratch copy. It filed 21 findings: 19 new ones and 2
+earlier ones that were only partly fixed. Two of them are the same defect. Three were rated
+medium, the rest low: these are edge cases, but several would have cost GPU time or a finished
+document without saying so. All were fixed in three parallel branches with separate files
+(core and cluster scripts; reader adapters; gate and figures), then merged. The merged suite
+went from 473 to TBD tests (TBD run without node/KaTeX; the other TBD need it).
+
+**Recovery that could still go wrong.**
+
+- A folder named in an `@listfile` (as `ls -d papers/*` or `find papers` write them) made
+  ingest exit 3 on every submission, so its shard was never processed and recovery never
+  converged. [O-005]'s rule took any failed system call on a readable path for a system
+  failure, and a folder is readable. Folders in a listfile are now walked, as folders in
+  `INPUTS` are. An input that cannot be read at all (missing, damaged, no permission) is
+  skipped with a warning, as `tools/incomplete.py` skips it. Only a failed write, or an error
+  that is the system's whatever the file (no space, quota, a read-only or stale file system),
+  still exits 3.
+- `/scratch` deletes files one by one. If the purge goes by access time, the page images and
+  read JSON go first, because every resubmission reads the manifest and the review JSON again
+  and the others only once. A finished document left with its manifest and no page images had
+  its Markdown replaced by "OCR failed" placeholders at the next resubmission, and the
+  documented `--retry-failed` recovery did the same. Such a document now counts as purged and
+  is left alone. An unfinished one gets its lost page images rendered again, and a page image
+  that vanishes while the reader runs leaves its page in `todo` (exit 3) instead of becoming a
+  placeholder. Wulver's purge rule is not published, so this guards against either kind.
+- `REVIEW_ARGS=--force` re-ingested purged documents without reading them, and the next plain
+  resubmission then read, reviewed and rewrote them. Only a forced read now redoes a purged
+  document.
+- A rerun with another profile into the same `OUT` did nothing, while the sbatch header
+  promised a re-read and the log blamed a purge. The header now says another profile needs its
+  own `OUT`. `report.json` records the `WORK` it was made from, and a run from another `WORK`
+  into the same `OUT` says so in its log.
+
+**The cluster scripts.**
+
+- `#!/bin/bash -l` loaded the login profile (Lmod, a `conda init` hook in `~/.bashrc`) before
+  the script's first line, so a USR1 in those seconds still killed the task without a
+  requeue. The script now traps USR1 first and then loads the profile itself
+  (`WOCR_LOGIN_PROFILE`).
+- `WOCR_TORCH_BACKEND=cu128` was documented, but vLLM publishes its CUDA 12 wheel as `+cu129`
+  only, so that install failed on a 404. Only `cu130` and `cu129` are accepted now; `cu129`
+  also runs on a 570-series driver.
+
+**Which reading of a page is kept.** A page whose reading was cut off or looped is read twice,
+and the attempt with fewer flagged blocks was kept. Since [O-005] a left-column cut leaves two
+tail regions, and Chandra flagged every block of a repeated element, so the count could favour
+the attempt that lost more: one cut in the title over one cut low in the left column, or a
+cut-off retry over a complete page with one repeated element. A cut now counts once and each
+repeated element once; then the area lost decides.
+
+**A repeated element is no longer a degenerate draft.** The kept copy of an element the model
+wrote several times was flagged `repetition`, which the gate treats as degenerate: no change
+limit and no escape check, so the reviewer could rewrite correct text freely. It now gets its
+own flag, `repeated`, and is reviewed under the flagged limit, like `json_repaired`. The page
+is still re-read once. A loop inside one block's own text is still `repetition`.
+
+**The readers.**
+
+- The column rule for cut-off pages also fired on one-column pages whose cut fell in a short
+  left-aligned element (a list item, a heading). The rest of the page was then split into a
+  left and a right half, which the reviewer transcribed separately. Two columns now need left
+  boxes that look like a column.
+- A tail region fitted between kept columns ran to the page bottom, so a full-width float
+  below the columns was cut in half. It now ends where the columns end, with a full-width
+  region below them.
+- olmOCR: a LaTeX row break with spacing (`\\[4pt]`) was taken for the start of display math,
+  which mangled the formula and swallowed the following paragraphs. An escaped bracket around
+  a citation key (`\[ABC+20\]`) could also become a formula block; only a body that looks
+  like math is lifted now.
+- dots: one single-backslash slip in a JSON string turned its correctly doubled `\\{` or
+  `\\|` into row breaks; the repair now works escape by escape. A text string whose only
+  single-backslash commands start with `\n` (`\nabla`, `\nu`, `\ne`) is now repaired
+  instead of decoding a newline.
+
+**The gate and figures.**
+
+- Agreement ignored whitespace that renders (inside `\text{…}`, a list item's indentation),
+  so a reviewer fix that restored it was thrown away.
+- The escape check counted a table's own HTML tags as bare `<`, which rejected correct table
+  fixes. The check for "not a transcription" rejected short real answers, such as "(8)" or a
+  parenthetical remark that mentions "empty".
+- For a page olmOCR read turned, the reviewer now sees the turned page.
+- TikZ: a mid-arrow drawn through decorations (`->-`) now counts as directed, and the repair
+  instruction for a multi-panel graph asks for vertex names unique across panels.
+
+None of this changes what [O-002] asks for.
+
+---
+
 ## 2026-10-02 — Note [O-005]: verifying the [O-004] fixes — 41 more findings fixed
 
 After [O-004], an independent pass checked its fixes against the merged code and reviewed the

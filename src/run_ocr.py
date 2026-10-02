@@ -33,8 +33,9 @@ where it stopped. ``--force`` redoes a stage's finished pages; ``ingest
 read/, review/ and figures/ (``all --force`` does not re-render). Review
 requests are pooled across the whole shard and each page is saved as soon as
 all its requests are done. A document whose Markdown is in <out> but whose
-work dir is gone (WORK on /scratch is purged) counts as finished, as for
-tools/incomplete.py: <out> is the completion record (see select_docs).
+work dir is gone or lost page images (WORK on /scratch is purged) counts as
+finished, as for tools/incomplete.py: <out> is the completion record (see
+select_docs); only a forced read redoes it.
 
 Failure semantics. A page whose reading fails deterministically (the server
 rejects the request, the adapter cannot parse the reply, the image cannot be
@@ -44,8 +45,10 @@ lists it; ``read --retry-failed`` tries again). A review request that fails
 deterministically is recorded as that block's final decision. A SERVER
 failure (unreachable, 5xx, timeouts) is never saved as done: the affected
 pages stay in ``todo`` and the command exits 3. So does a SYSTEM failure
-while ingesting (disk full, quota, an I/O error): only an input that is
-itself unusable gets FAILED.json.
+while ingesting (disk full, quota, a failed write) or a page image that is
+gone when it is read: only an input that is itself unusable gets
+FAILED.json, and one that cannot be read at all (a directory, missing, no
+permission, a damaged file) is skipped.
 
 Exit codes: 0 done; 85 stopped by SIGUSR1/SIGTERM after saving (requeue,
 see slurm/requeue_lib.sh); 3 model server or system failure (unfinished work
@@ -64,6 +67,7 @@ if __name__ == "__main__":
     install_signal_handlers()
 
 import argparse  # noqa: E402
+import errno  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import shutil  # noqa: E402
@@ -92,8 +96,15 @@ class ServerDown(Exception):
 
 
 class SystemFailure(Exception):
-    """Some input could not be ingested because of the system (disk full,
-    quota, an I/O error), not because of the input: nothing is marked."""
+    """Some input could not be ingested, or a page not read, because of the
+    system (disk full, quota, a failed write, a page image gone), not
+    because of the input: nothing is marked."""
+
+
+# Errors that are the system's whatever file they name: no space or quota,
+# a read-only or stale file system, no file handles or memory left.
+SYSTEM_ERRNOS = {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC), errno.EROFS,
+                 errno.ESTALE, errno.EMFILE, errno.ENFILE, errno.ENOMEM}
 
 
 def log(msg: str):
@@ -118,24 +129,40 @@ def select_docs(args) -> list[str]:
 
     An input that cannot be ingested gets <out>/<doc_id>/FAILED.json (a
     terminal state tools/incomplete.py counts as done) instead of blocking
-    its shard; one that cannot be read at all is skipped. A failure of the
-    system rather than of the input (disk full, quota, an I/O error) marks
-    nothing: the other inputs are ingested, then SystemFailure is raised.
-    A document whose Markdown is in <out> but whose work dir is gone (WORK on
-    /scratch is purged) is finished, as tools/incomplete.py says: it is not
-    read again, unless --force, or --retry-failed and it has failed pages."""
+    its shard; one that cannot be read at all (a directory, missing, no
+    permission, a damaged file) is skipped, as tools/incomplete.py skips it.
+    A failure of the system rather than of the input (disk full, quota, a
+    failed write) marks nothing: the other inputs are ingested, then
+    SystemFailure is raised.
+
+    A document whose Markdown is in <out> but whose work dir is gone or
+    lost page images (WORK on /scratch is purged) is finished, as
+    tools/incomplete.py says: it is not ingested, read or reviewed again,
+    unless the reading is forced or --retry-failed finds failed pages in
+    its report (see _finished_and_purged)."""
     i, n = parse_shard(args.shard)
     if args.inputs:
         paths = ing.discover(args.inputs)[i::n]
-        ids, system, purged = [], [], 0
+        ids, system, purged, elsewhere = [], [], 0, []
         for p in paths:
             check_stop()
             try:
                 digest = ing.sha256_file(p)
-                doc_id = ing.make_doc_id(p, digest)
-                if _finished_and_purged(args, doc_id):
-                    purged += 1
-                    continue
+            except Exception as e:      # noqa: BLE001 — the input cannot be read
+                if isinstance(e, OSError) and e.errno in SYSTEM_ERRNOS:
+                    log(f"INGEST ERROR {p}: {e!r}")
+                    system.append(f"{p}: {e!r}")
+                else:                   # nothing to name it by: not marked
+                    log(f"INGEST ERROR {p}: cannot read it ({e!r}): skipped")
+                continue
+            doc_id = ing.make_doc_id(p, digest)
+            if _finished_and_purged(args, doc_id):
+                purged += 1
+                made = _made_under(os.path.join(args.out or args.work, doc_id))
+                if made and os.path.realpath(made) != os.path.realpath(args.work):
+                    elsewhere.append(made)
+                continue
+            try:
                 ing.ingest(p, args.work, dpi=args.dpi, digest=digest,
                            force=args.force and args.cmd == "ingest")
                 ids.append(doc_id)
@@ -144,15 +171,16 @@ def select_docs(args) -> list[str]:
                     os.remove(stale)
             except Exception as e:      # noqa: BLE001 — a corrupt file is marked, loudly
                 log(f"INGEST ERROR {p}: {e!r}")
-                # A failed system call on a readable input is the system's
-                # fault. (Pillow's decoding errors are OSErrors without errno.)
-                if isinstance(e, OSError) and e.errno is not None and os.access(p, os.R_OK):
+                if _system_error(e, p):
                     system.append(f"{p}: {e!r}")
                 else:
-                    _mark_ingest_failed(args, p, e)
+                    _mark_ingest_failed(args, p, e, doc_id)
         if purged:
-            log(f"{purged} document(s) already finished in {args.out or args.work} "
-                "(work dirs purged): not redone")
+            log(f"{purged} document(s) already finished in {args.out or args.work}, "
+                f"with no complete work dir under {args.work}: not redone")
+        if elsewhere:
+            log(f"WARNING: {len(elsewhere)} of them were made under another WORK, e.g. "
+                f"{elsewhere[0]}: a run with another profile needs its own OUT")
         if system:
             raise SystemFailure(f"{len(system)} input(s) not ingested, e.g. {system[0]}")
         ids = list(dict.fromkeys(ids))  # the same file twice is one document
@@ -162,15 +190,48 @@ def select_docs(args) -> list[str]:
     return [os.path.join(args.work, d) for d in docs[i::n]]
 
 
-def _finished_and_purged(args, doc_id: str) -> bool:
-    """True if the document is finished in <out> but its work dir is gone:
-    then it is not ingested, read and reviewed again (see select_docs)."""
-    if args.force or os.path.exists(os.path.join(args.work, doc_id, "manifest.json")):
+def _system_error(e: Exception, path: str) -> bool:
+    """Whether ingesting ``path`` failed because of the system. Its bytes
+    were just hashed, so a failed system call while it is still a readable
+    file is the system's (a full or read-only WORK, ...). Pillow's decoding
+    errors are OSErrors without errno: the input's."""
+    if not isinstance(e, OSError) or e.errno is None:
         return False
+    return e.errno in SYSTEM_ERRNOS or (os.path.isfile(path) and os.access(path, os.R_OK))
+
+
+def _finished_and_purged(args, doc_id: str) -> bool:
+    """True if the document is finished in <out> (its Markdown is there) but
+    its work dir is gone, or lost page images: /scratch purges file by file,
+    and the page images and read JSON, read once, go first where the purge
+    goes by access time. Then it is not ingested, read and reviewed again
+    (see select_docs). Only a forced READ redoes it (ingest, read or all
+    --force, or todo --stage read --force): a review or assemble --force
+    could not redo a document without a reading, and would leave a work dir
+    that a later plain run took for unfinished. So does --retry-failed when
+    its report lists failed pages."""
     out_dir = os.path.join(args.out or args.work, doc_id)
     if not os.path.exists(os.path.join(out_dir, doc_id + ".md")):
         return False
-    return not (getattr(args, "retry_failed", False) and _report_failed_pages(out_dir))
+    if args.force and (args.cmd in ("ingest", "read", "all")
+                       or getattr(args, "stage", None) == "read"):
+        return False
+    if getattr(args, "retry_failed", False) and _report_failed_pages(out_dir):
+        return False
+    doc_dir = os.path.join(args.work, doc_id)
+    try:
+        return bool(ing.missing_pages(doc_dir, load_manifest(doc_dir)))
+    except (OSError, ValueError):       # no (readable) manifest: purged
+        return True
+
+
+def _made_under(out_dir: str) -> str | None:
+    """The WORK root that <out_dir>'s report.json says it was made from."""
+    try:
+        with open(os.path.join(out_dir, "report.json"), encoding="utf-8") as f:
+            return json.load(f).get("work")
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _report_failed_pages(out_dir: str) -> list:
@@ -181,12 +242,13 @@ def _report_failed_pages(out_dir: str) -> list:
         return []
 
 
-def _mark_ingest_failed(args, path: str, err: Exception) -> None:
-    try:
-        doc_id = ing.make_doc_id(path, ing.sha256_file(path))
-    except OSError as e:                # unreadable: nothing to name it by
-        log(f"  (cannot hash {path} either: {e!r}; not marked)")
-        return
+def _mark_ingest_failed(args, path: str, err: Exception, doc_id: str | None = None) -> None:
+    if doc_id is None:
+        try:
+            doc_id = ing.make_doc_id(path, ing.sha256_file(path))
+        except OSError as e:            # unreadable: nothing to name it by
+            log(f"  (cannot hash {path} either: {e!r}; not marked)")
+            return
     d = os.path.join(args.out or args.work, doc_id)
     if os.path.exists(os.path.join(d, doc_id + ".md")):
         log(f"  (not marking {doc_id} failed: its output already exists)")
@@ -228,15 +290,39 @@ def stage_ingest(args):
     log(f"ingested {len(docs)} document(s) under {args.work}")
 
 
+def _area(bbox) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _attempt_loss(blocks: list[Block]) -> tuple:
+    """How much of the page a reading lost, to choose between attempts:
+    first a cut (counted once, however many tail regions it left) plus each
+    element that loops in its text ("repetition") or that the reader kept
+    once of several copies ("repeated"); then the area of the regions the
+    cut lost, a region without a box counting as the whole page. (0, 0) is
+    a clean reading, which needs no retry."""
+    cut = [b for b in blocks if "truncated" in b.flags]
+    loops = sum(1 for b in blocks if {"repetition", "repeated"} & set(b.flags))
+    lost = sum(_area(b.bbox) if b.bbox and b.meta.get("truncated_tail") else 1.0
+               for b in cut)
+    return (bool(cut) + loops, round(lost, 6))
+
+
 def _read_one(reader, doc_dir: str, idx: int, retries: int) -> Page:
-    """Read one page. Stopped/ServerError propagate (nothing is saved);
-    deterministic failures end in a saved placeholder page (see module doc)."""
+    """Read one page. Stopped/ServerError propagate (nothing is saved), and
+    so does a FileNotFoundError for a page image that is gone (the page stays
+    in todo; the next run's ingest renders it again); deterministic failures
+    end in a saved placeholder page (see module doc). A reading that was cut
+    off, looped, or repeated an element is retried; the attempt that lost
+    least is kept (_attempt_loss), the first of equals."""
     check_stop()
     img_path = os.path.join(doc_dir, "pages", page_stem(idx) + ".png")
     errors: list[str] = []
     try:
         with Image.open(img_path) as im:
             img = im.convert("RGB")
+    except FileNotFoundError:
+        raise
     except Exception as e:              # noqa: BLE001 — undecodable page image
         return _save_failed_page(reader, doc_dir, idx, img_path, (0, 0), [repr(e)[:800]])
     best = None
@@ -252,11 +338,10 @@ def _read_one(reader, doc_dir: str, idx: int, retries: int) -> Page:
             continue
         for b in blocks:
             b.flags = validate_block(b)
-        degenerate = sum(1 for b in blocks
-                         if {"truncated", "repetition"} & set(b.flags))
-        if best is None or degenerate < best[0]:
-            best = (degenerate, blocks, attempt)
-        if degenerate == 0:
+        loss = _attempt_loss(blocks)
+        if best is None or loss < best[0]:
+            best = (loss, blocks, attempt)
+        if loss == (0, 0):
             break
     if best is None:
         return _save_failed_page(reader, doc_dir, idx, img_path, img.size, errors)
@@ -325,8 +410,11 @@ def stage_read(args):
     results = map_concurrent(lambda dk: _read_one(reader, dk[0], dk[1], args.retries),
                              todo, args.workers)
     server = [r for r in results if isinstance(r, ServerError)]
+    gone = [r for r in results if isinstance(r, FileNotFoundError)]
     for it, r in zip(todo, results):
-        if isinstance(r, Exception) and not isinstance(r, (Stopped, ServerError)):
+        if isinstance(r, FileNotFoundError):
+            log(f"read: page image gone {it}: {r!r}")   # stays in todo
+        elif isinstance(r, Exception) and not isinstance(r, (Stopped, ServerError)):
             log(f"read ERROR {it}: {r!r}")      # a bug: the page stays in todo
     ok = [r for r in results if isinstance(r, Page)]
     failed = sum(bool(p.meta.get("failed")) for p in ok)
@@ -334,6 +422,10 @@ def stage_read(args):
         f"in {time.time() - t0:.0f}s")
     if server:
         raise ServerDown(f"{len(server)} page(s) not read: {server[0]}")
+    if gone:
+        raise SystemFailure(f"{len(gone)} page image(s) gone from WORK, e.g. {gone[0]}; "
+                            "those pages stay in todo (a run with --inputs renders lost "
+                            "page images again)")
 
 
 class _ImageCache:
@@ -454,16 +546,17 @@ def stage_assemble(args):
         if os.path.isdir(src_fig) and os.path.abspath(src_fig) != os.path.abspath(dst_fig):
             shutil.copytree(src_fig, dst_fig, dirs_exist_ok=True)
         atomic_write_text(os.path.join(out_dir, "report.json"),
-                          json.dumps(make_report(man, pages), indent=1))
+                          json.dumps(make_report(man, pages, work=args.work), indent=1))
         atomic_write_text(os.path.join(out_dir, man["doc_id"] + ".md"), md)
         log(f"assembled {out_dir}/{man['doc_id']}.md")
 
 
-def make_report(man: dict, pages: list[Page]) -> dict:
+def make_report(man: dict, pages: list[Page], work: str | None = None) -> dict:
     blocks = [b for p in pages for b in p.blocks]
     return {
         "doc_id": man["doc_id"], "source": man["source"], "n_pages": man["n_pages"],
         "readers": sorted({p.reader for p in pages}),
+        "work": os.path.abspath(work) if work else None,
         "reviewed_pages": sum(p.stage == "review" for p in pages),
         "failed_pages": [p.index + 1 for p in pages if p.meta.get("failed")],
         "truncated_pages": [p.index + 1 for p in pages if any(

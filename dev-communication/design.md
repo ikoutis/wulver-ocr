@@ -57,9 +57,11 @@ The design gives each model the job it is good at and contains each one's failur
    unbalanced inline `$` or an unclosed `$$`, and inconsistent table shapes. They also check
    that **KaTeX can parse every formula**. KaTeX is the renderer olmOCR-Bench grades math with,
    and the one GitHub and Obsidian display it with. Two flags come from what a reader adapter
-   saw while parsing: `repetition` on an element the model repeated (kept once), and
+   saw while parsing: `repeated` on an element the model wrote several times (kept once), and
    `json_repaired` on a dots element whose single-backslash LaTeX had to be repaired before its
-   JSON could be read.
+   JSON could be read. Neither marks a degenerate draft: the kept copy of a repeated element
+   is an ordinary reading, so it is reviewed under the flagged limit below. A loop inside one
+   block's own text is `repetition`, which is degenerate.
 3. The **reviewer** (generalist) sees only what needs it. That means every display formula (the
    project's emphasis, so all of them are reviewed by default), every flagged block, and every
    figure. Each request carries **one image crop plus the reader's draft**. The reviewer answers
@@ -70,10 +72,14 @@ The design gives each model the job it is good at and contains each one's failur
      flagged;
    - there is no change limit when the draft was degenerate (empty, looping, or truncated). Then
      the reviewer acts as the fallback reader for that block. For an empty draft, an answer of
-     `correct`, or one with no letters or digits, is not a transcription: the gap stays marked;
-   - the reader's Markdown and HTML escapes (`\*`, `&lt;`) survive an accepted edit.
+     `correct`, one with no letters or digits, or a note about the crop ("(blank)", "(nothing
+     to transcribe)") is not a transcription: the gap stays marked. A short reading such as
+     "(8)" is one;
+   - the reader's Markdown and HTML escapes (`\*`, `&lt;`) survive an accepted edit (the check
+     ignores a table's own HTML tags).
 
    An answer that changes nothing counts as agreement, and the reader keeps the provenance.
+   Whitespace that renders (inside `\text{…}`, a list item's indentation) is a change.
    Rejected proposals are kept in the block's history.
 5. **Assembly** (CPU) builds the Markdown. It drops running headers, footers, and page numbers,
    re-joins paragraphs split by a page break, and links the figure crops with their descriptions.
@@ -120,7 +126,8 @@ confirmed before we cite it in anything.)*
   pages/p0001.png …
         │  READ (GPU, reader server): one request per page → JSON blocks
         │    {type, bbox, content}; validators flag; looping/truncated pages
-        │    are re-read once with sampling + repetition penalty; figure crops saved
+        │    are re-read once with sampling + repetition penalty, and the attempt
+        │    that lost least is kept; figure crops saved
         ▼
   read/p0001.json …
         │  REVIEW (GPU, reviewer server): per wanted block, crop + draft →
@@ -162,17 +169,28 @@ history.
   --retry-failed` lists the shards that have such pages.
 - **An input that cannot be ingested** (a corrupt or unsupported file) gets
   `<out>/<doc_id>/FAILED.json`, a terminal state that `tools/incomplete.py` counts as done.
-- **A system failure during ingest** (disk full, quota, an I/O error). Nothing is marked
-  failed; the other inputs are ingested, then the stage exits 3, so the shard stays listed
-  for recovery.
+  One that cannot be read at all (missing, damaged, no permission) is skipped with a warning,
+  as `tools/incomplete.py` skips it. A folder named in an `@listfile` is walked, as one named
+  in `INPUTS` is.
+- **A system failure during ingest** (disk full, quota, a read-only or stale file system, a
+  failed write). Nothing is marked failed; the other inputs are ingested, then the stage
+  exits 3, so the shard stays listed for recovery. A page image that vanishes from `WORK`
+  while the reader runs is treated the same way: its page stays in `todo`, and the next run
+  renders it again.
 
 None of these can block a shard forever or pass off unfinished work as finished.
 
 **The completion record is `<out>`.** A document is done when `<out>/<doc_id>/<doc_id>.md`
 exists, for the stages as for `tools/incomplete.py`. `WORK` lives on `/scratch`, which purges
-files after 30 days; a finished document whose work directory is gone is not read and reviewed
-again when its shard is resubmitted (unless `--force`, or `--retry-failed` and it has failed
-pages).
+files after 30 days, one by one. A finished document whose work directory is gone, or has
+lost page images, is not read and reviewed again when its shard is resubmitted. If the purge
+goes by access time, the page images and read JSON go first, because every resubmission reads
+the manifest and the review JSON again and the others only once. Only a forced read
+(`READ_ARGS=--force`) redoes such a document, or `--retry-failed` when it has failed pages; a
+review or assemble `--force` leaves it alone. A document not finished yet gets its lost page
+images rendered again. So a run with another profile needs its own `<out>`: `report.json`
+records the `WORK` it was made from, and a run from another `WORK` into the same `<out>` finds
+everything done and says so.
 
 **Shards.** Each array task takes every N-th document of the input list. The list is ordered
 by real path, so `run_ocr` (handed absolute paths by the sbatch script) and
@@ -195,7 +213,8 @@ header, footer, page_number, code, reference, other. Four are implemented:
   the reviewer sees the full page and figures are not cropped. A `#` heading is the title.
 - `olmocr`: olmOCR-2 as its own pipeline runs it (its prompt, 1288 px rendering, 8000-token
   cap, and per-attempt temperatures, taken from allenai/olmocr). This is the published
-  baseline arm.
+  baseline arm. When the model says the page is rotated, it is read turned, and the reviewer
+  sees it turned too.
 
 Adding a model means adding one adapter module and one profile.
 
@@ -204,7 +223,13 @@ rest of the page becomes a *truncated tail*: an empty block whose box is the reg
 did not reach. That region starts at the element the model was writing when it was cut off
 (when that element's box is unknown, a fallback region below what was read is used). On a
 two-column page cut in the left column, with nothing read to the right of the cut, the right
-column gets a second region. The page is re-read once. If it is still cut off, the
+column gets a second region. The page counts as two-column only when the left boxes look like
+a column (they share one right edge near the middle); a one-column page cut in a short
+left-aligned element (a list item, a heading) keeps one full-width region. A region fitted
+between kept columns ends where they end, with a full-width region below them when there is
+room (a float at the bottom of the page). The page is re-read once, and the attempt that lost
+least is kept: a cut counts once, however many regions it left, and so does each looping or
+repeated element; then the area lost decides. If it is still cut off, the
 reviewer transcribes each region from its crop. A tail it transcribed is recorded
 (`tail_recovered`) and `report.json` lists its page under `truncated_recovered`, so a
 transcription of the wrong region can never make the cut disappear. A tail still empty is
@@ -365,7 +390,10 @@ Up to four array tasks can share a 4-GPU node, so nothing about a server is fixe
 - A signal that lands between pipeline commands, or while a server is starting, requeues at
   once; in dml's version it would have killed the batch shell. So does one that kills the
   pipeline before its handler is installed (exit 138), and one that arrives while the script
-  is still loading conda.
+  is still loading the login profile or conda. The script is not a login shell
+  (`#!/bin/bash -l` loaded the profile before its first line could trap the signal): it traps
+  USR1 first, then loads `/etc/profile` and the user's login profile itself
+  (`WOCR_LOGIN_PROFILE`).
 - Resubmitting exactly the unfinished shards is one line with `tools/incomplete.py` (with
   `--retry-failed`, also the shards that have failed pages).
 
@@ -388,7 +416,7 @@ runs one shard.
 |---|---|---|
 | conda env | `/project/ikoutis/conda_env/wocr` | same convention as dml (`tools/setup_env.sh`) |
 | model weights | `/project/ikoutis/wocr_models/<name>` | persistent (scratch purges after 30 days); ~65 GB for the default pair, inside the 2 TB group quota |
-| page images, page JSON | `/scratch/ikoutis/$USER/wocr/work/<profile>` | large (1–3 MB per page at 200 dpi), regenerable; one directory per model profile so that two profiles never share a reading. Purged after 30 days: a finished document is not redone after a purge (`<out>` is the completion record, §3), but its per-page provenance is gone, so copy it to `/project` to keep it |
+| page images, page JSON | `/scratch/ikoutis/$USER/wocr/work/<profile>` | large (1–3 MB per page at 200 dpi), regenerable; one directory per model profile so that two profiles never share a reading. Purged after 30 days, file by file: a finished document is not redone after a purge, even a partial one (`<out>` is the completion record, §3), but its per-page provenance is gone, so copy it to `/project` to keep it |
 | Markdown, figures, reports | `/project/ikoutis/$USER/wocr/out` | the product; backed up |
 
 Weights are staged once with `tools/stage_models.py`, either on a login node (the dml
@@ -400,7 +428,9 @@ whose wheels bundle torch and the CUDA runtime. vLLM is pinned (`WOCR_VLLM_SPEC`
 `vllm==0.30.0`). The GPU nodes' driver version is not published, so `tools/setup_env.sh` picks
 the build from the driver when `nvidia-smi` sees one: the CUDA 13 build from PyPI for a driver
 ≥ 580, and otherwise the release's `+cu129` wheel with torch from the PyTorch cu129 index (as
-vLLM's install docs do it; CUDA 12 builds run on drivers from R525 on). A login node has no
+vLLM's install docs do it; CUDA 12 builds run on drivers from R525 on). `+cu129` is the only
+CUDA 12 wheel a release publishes (`+cu128` is a 404), so no other `cu12x` is accepted
+without the wheel itself (`WOCR_VLLM_WHEEL`). A login node has no
 driver, so there it installs the CUDA 13 build with a warning. The GPU check then settles it,
 run on the free `debug_gpu` partition:
 `srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1
@@ -449,10 +479,12 @@ VS Code, and MkDocs with arithmatex:
     their drawn positions.
 
   The reviewer writes only the TikZ, in a fixed pattern (`src/tikz.py`), and the pipeline
-  parses it back. The parsed vertices and edges go into the page JSON (`meta["graph"]`), and the
+  parses it back (an arrow drawn through decorations, as a `->-` mid-arrow style, counts as
+  directed). The parsed vertices and edges go into the page JSON (`meta["graph"]`), and the
   Markdown version is rendered from them, so the two cannot disagree. TikZ that does not parse,
   or whose edges reference undeclared vertices, is sent back to the reviewer once with the
-  problems listed. If it still fails, the figure is flagged (`tikz_*`) and the Markdown version
+  problems listed (a multi-panel figure: one scope per panel, vertex names unique across
+  panels). If it still fails, the figure is flagged (`tikz_*`) and the Markdown version
   says it is unavailable.
 - `<!-- page N -->` comments mark page boundaries (invisible when rendered; `--no-page-markers`
   turns them off).
@@ -532,7 +564,7 @@ maximise net formula accuracy. Because of degrading levels, this can be done per
 
 | # | milestone | content | entry |
 |---|---|---|---|
-| M0 | scaffold | pipeline, reader adapters (Chandra 2, dots, Markdown, olmOCR), gated reviewer, KaTeX validator, figure describer with TikZ graphs, assembly, Wulver tooling, CPU test suite; hardened by an adversarial code review ([O-004]) and its verification ([O-005]) | [O-001], [O-004], [O-005] |
+| M0 | scaffold | pipeline, reader adapters (Chandra 2, dots, Markdown, olmOCR), gated reviewer, KaTeX validator, figure describer with TikZ graphs, assembly, Wulver tooling, CPU test suite; hardened by an adversarial code review ([O-004]) and two verifications ([O-005], [O-006]) | [O-001], [O-004], [O-005], [O-006] |
 | M1 | smoke run on Wulver | env + weights staged; 3–5 papers end to end; measured pages/s, GPU memory, review decisions; fix whatever the real models do differently from their docs (prompt formats, box frames, served names) | [O-002] |
 | M2 | evaluation set + metrics | arXiv-source builder (`eval/build_arxiv.py`), formula normaliser, CDM via a headless KaTeX render, TEDS, edit distance; A0 vs A1 on ~50 papers × 4 degradation levels | — |
 | M3 | bake-off + calibration | A2–A5; pick the default reader/reviewer pair from data; calibrate the gate thresholds | — |

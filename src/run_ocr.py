@@ -27,8 +27,10 @@ Work layout, per document (see ingest.py for doc ids):
     <out>/<doc_id>/FAILED.json           the input could not be ingested
 
 Resumability. Every page is written atomically when it finishes, and every
-stage skips pages already on disk (``--force`` redoes them), so a preempted
-or requeued job resumes where it stopped. Review requests are pooled across
+stage skips pages already on disk, so a preempted or requeued job resumes
+where it stopped. ``--force`` redoes a stage's finished pages; ``ingest
+--force`` also re-renders the page images and so discards that document's
+read/, review/ and figures/ (``all --force`` does not re-render). Review requests are pooled across
 the whole shard and each page is saved as soon as all its requests are done.
 
 Failure semantics. A page whose reading fails deterministically (the server
@@ -112,8 +114,12 @@ def select_docs(args) -> list[str]:
         for p in paths:
             check_stop()
             try:
-                ids.append(ing.ingest(p, args.work, dpi=args.dpi,
-                                      force=args.force and args.cmd == "ingest")["doc_id"])
+                doc_id = ing.ingest(p, args.work, dpi=args.dpi,
+                                    force=args.force and args.cmd == "ingest")["doc_id"]
+                ids.append(doc_id)
+                stale = os.path.join(args.out or args.work, doc_id, "FAILED.json")
+                if os.path.exists(stale):   # an earlier failure was transient
+                    os.remove(stale)
             except Exception as e:      # noqa: BLE001 — a corrupt file is marked, loudly
                 log(f"INGEST ERROR {p}: {e!r}")
                 _mark_ingest_failed(args, p, e)
@@ -131,6 +137,9 @@ def _mark_ingest_failed(args, path: str, err: Exception) -> None:
         log(f"  (cannot hash {path} either: {e!r}; not marked)")
         return
     d = os.path.join(args.out or args.work, doc_id)
+    if os.path.exists(os.path.join(d, doc_id + ".md")):
+        log(f"  (not marking {doc_id} failed: its output already exists)")
+        return
     os.makedirs(d, exist_ok=True)
     atomic_write_text(os.path.join(d, "FAILED.json"), json.dumps(
         {"doc_id": doc_id, "source": os.path.abspath(path), "stage": "ingest",
@@ -401,6 +410,8 @@ def make_report(man: dict, pages: list[Page]) -> dict:
         "readers": sorted({p.reader for p in pages}),
         "reviewed_pages": sum(p.stage == "review" for p in pages),
         "failed_pages": [p.index + 1 for p in pages if p.meta.get("failed")],
+        "truncated_pages": [p.index + 1 for p in pages if any(
+            b.meta.get("truncated_tail") and not b.content.strip() for b in p.blocks)],
         "review_errors": sum(1 for b in blocks if b.meta.get("reviewed") == "error"
                              or b.meta.get("description_error")),
         "block_types": dict(Counter(b.type for b in blocks)),

@@ -49,7 +49,7 @@ def strip_comments(code: str) -> str:
 
 def braces_balanced(s: str) -> bool:
     depth = 0
-    for ch in re.sub(r"\\[{}]", "", s):
+    for ch in re.sub(r"\\[\\{}]", "", s):     # "\\{" is a line break + group
         depth += (ch == "{") - (ch == "}")
         if depth < 0:
             return False

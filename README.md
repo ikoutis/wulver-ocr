@@ -33,22 +33,25 @@ JSON, so each output block can be traced to the model that wrote it.
 src/
   ├── ingest.py       PDF/images → page PNGs + manifest (content-addressed doc ids)
   ├── readers/        stage-1 adapters → common Block schema: chandra (HTML layout),
-  │                   dots (layout JSON), markdown (whole-page Markdown, any VLM)
+  │                   dots (layout JSON), markdown (whole-page Markdown, any VLM), olmocr
   ├── validate.py     CPU checks: LaTeX structure, repetition loops, table shape, …
   ├── katex_check.py  optional KaTeX parse of every formula (persistent node worker)
   ├── review.py       stage-2 gated proofreading (prompts, gate, provenance)
   ├── figures.py      figure crops + generated descriptions / structure
   ├── tikz.py         graph TikZ: canonical form, parser, checks, Markdown rendering
   ├── assemble.py     blocks → Markdown (running heads dropped, page-break joins)
-  ├── backend.py      OpenAI-compatible HTTP client (talks to `vllm serve`)
+  ├── backend.py      OpenAI-compatible HTTP client (talks to `vllm serve`): typed
+  │                   server/request errors, retries, circuit breaker
+  ├── stopflag.py     cooperative stop on SIGUSR1/SIGTERM (requeue without losing work)
   ├── schema.py       Page / Block data model (the JSON every stage reads/writes)
   └── run_ocr.py      CLI: ingest | read | review | assemble | all | status | todo
 profiles/             model pairs: default (Chandra 2 + Qwen3.8-27B), dots (MIT reader),
-                      conservative (dots.mocr + Qwen3-VL-32B); repo ids, vLLM flags
+                      conservative (dots.mocr + Qwen3-VL-32B), olmocr (baseline); vLLM flags
 slurm/                ocr.sbatch (sharded array), serve_lib.sh, requeue_lib.sh
 tools/                setup_env.sh, stage_models.py, incomplete.py
 eval/                 degrade.py (scan simulation for the arXiv eval set)
-tests/                CPU-only unit + end-to-end tests (fake model servers)
+tests/                CPU-only unit + end-to-end tests (fake model servers, fake
+                      vllm/scontrol for the SLURM scripts)
 dev-communication/    design doc + dated task/reply log
 ```
 
@@ -65,6 +68,10 @@ Wulver (once; follows the dml repo's conventions):
 
 ```bash
 bash tools/setup_env.sh                          # conda env at /project/ikoutis/conda_env/wocr (+ vLLM, KaTeX)
+module load Miniforge3 && source "$(conda info --base)/etc/profile.d/conda.sh" \
+    && conda activate /project/ikoutis/conda_env/wocr
+srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1 \
+    --time=00:10:00 bash -l tools/setup_env.sh --gpu-check   # does torch see the A100?
 python tools/stage_models.py --profile default   # ~65 GB of weights → /project/ikoutis/wocr_models
 ```
 
@@ -107,7 +114,7 @@ Batch settings are environment variables read by `slurm/ocr.sbatch`:
 |---|---|
 | `INPUTS` | documents: dirs, files, or `@listfile`, space-separated (required) |
 | `OUT`, `WORK` | output root (Markdown) and work root (page images, JSON); `WORK` defaults to a per-profile directory on `/scratch` |
-| `WOCR_PROFILE` | model pair: `default` (Chandra 2 + Qwen3.8-27B), `dots` (MIT reader), `conservative` |
+| `WOCR_PROFILE` | model pair: `default` (Chandra 2 + Qwen3.8-27B), `dots` (MIT reader), `conservative` (most mature on A100), `olmocr` (olmOCR-2 baseline) |
 | `PHASES` | subset of `read review assemble`, e.g. `PHASES="read assemble"` runs the reader only |
 | `READ_ARGS`, `REVIEW_ARGS` | extra flags for the read / review stage, e.g. `REVIEW_ARGS="--review-types formula,table"` |
 | `NSHARDS` | total shard count when resubmitting a subset of array indices |
@@ -147,8 +154,8 @@ out/<doc_id>/
                    "Graph — Markdown (simple)" and "Graph — TikZ"
   figures/*.png    figure crops, linked from the Markdown
   report.json      per-document summary: block types, review decisions,
-                   failed pages, review errors, remaining flags (where a
-                   human should look first)
+                   failed and truncated pages, review errors, remaining
+                   flags (where a human should look first)
 out/<doc_id>/FAILED.json   instead, if the input could not be ingested
 ```
 

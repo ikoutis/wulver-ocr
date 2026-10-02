@@ -160,7 +160,7 @@ None of these can block a shard forever or pass off unfinished work as finished.
 
 **Readers are adapters** (`src/readers/`). Each one maps a model's native output onto the common
 block vocabulary: title, heading, text, list, formula, table, figure, caption, footnote,
-header, footer, page_number, code, reference, other. Three are implemented:
+header, footer, page_number, code, reference, other. Four are implemented:
 
 - `chandra`: HTML layout blocks with boxes (Chandra OCR 2). Math comes back in `<math>` tags,
   which `src/readers/htmlmd.py` converts to `$…$`/`$$…$$`. A trailing equation number becomes
@@ -168,8 +168,11 @@ header, footer, page_number, code, reference, other. Three are implemented:
   alongside ours.
 - `dots`: layout JSON with boxes (the dots.ocr / dots.mocr format, prompt verified against the
   dots.mocr repository).
-- `markdown`: whole-page Markdown, split back into blocks. It works for olmOCR-style models or
-  any VLM. There are no boxes, so the reviewer sees the full page and figures are not cropped.
+- `markdown`: whole-page Markdown, split back into blocks, for any VLM. There are no boxes, so
+  the reviewer sees the full page and figures are not cropped.
+- `olmocr`: olmOCR-2 as its own pipeline runs it (its prompt, 1288 px rendering, 8000-token
+  cap, and per-attempt temperatures, taken from allenai/olmocr). This is the published
+  baseline arm.
 
 Adding a model means adding one adapter module and one profile.
 
@@ -210,7 +213,7 @@ reported.
 | OvisOCR2 (Alibaba, 2026-07) | 0.8B | Apache-2.0 | no | n/r | 96.47 | 75.1 (66.5) | candidate (`markdown`) |
 | MinerU2.5-Pro (2026-04/05) | 1.2B | Apache-2.0† (toolkit: custom) | yes | n/r | 95.75 | 70.1 (62.6) | candidate (needs adapter) |
 | PaddleOCR-VL-1.6 (2026-05) | 0.9B + detector | Apache-2.0 | yes | n/r | 96.34 | 59.3 (54.2) | not chosen: weakest under degradation |
-| olmOCR-2 (Ai2, 2025-10) | 7B | Apache-2.0 | no | 82.4 / 82.3 | 85.7 | 63.8 | baseline (`markdown`) |
+| olmOCR-2 (Ai2, 2025-10) | 7B | Apache-2.0 | no | 82.4 / 82.3 | 85.7 | 63.8 | baseline: profile `olmocr` (`olmocr`) |
 
 ✓ = checked against the project's own repository.
 
@@ -301,14 +304,24 @@ comfortably. The cost of phasing is one server start per phase (1–3 min with w
 shards should be sized to run for hours. A phase with nothing left to do starts no server at
 all.
 
+Up to four array tasks can share a 4-GPU node, so nothing about a server is fixed:
+
+- Each server gets a free port picked on the node at start-up.
+- A server counts as ready only when its own process is alive, its own log shows uvicorn's
+  "Application startup complete", and `/health` answers. A sibling task's server can never be
+  mistaken for ours.
+- If a server dies mid-stage, the pipeline exits 3 and the task stops. The log tail is copied
+  into the task's `.err`, and nothing unfinished is saved as done.
+
 **QOS and cost.** The default follows dml: `--account=ikoutis --qos=low`.
 
 - `low` is free and preemptable.
-- The scripts carry `--requeue` and `--signal=B:USR1@600`. On the signal, the pipeline finishes
-  the requests in flight, saves, and exits 85, and `slurm/requeue_lib.sh` (adapted from dml)
-  requeues the task.
-- A signal that lands between steps (during ingest or a server start) is recorded and acted on
-  before the next step. In dml's version, it would have killed the batch shell.
+- The scripts carry `--requeue` and `--signal=B:USR1@1800`, the same 30-minute lead as dml.
+  On the signal, the pipeline starts no new request, lets the ones in flight finish, saves every
+  finished page, and exits 85. `slurm/requeue_lib.sh` (adapted from dml) then requeues the task.
+- A signal that lands between pipeline commands, or while a server is starting, requeues at
+  once; in dml's version it would have killed the batch shell. So does one that kills the
+  pipeline before its handler is installed (exit 138).
 - Resubmitting exactly the unfinished shards is one line with `tools/incomplete.py`.
 
 If `low` queues too long, `--qos=standard` on the command line overrides the script. `standard`
@@ -325,7 +338,7 @@ The reviewer needs a full card.
 |---|---|---|
 | conda env | `/project/ikoutis/conda_env/wocr` | same convention as dml (`tools/setup_env.sh`) |
 | model weights | `/project/ikoutis/wocr_models/<name>` | persistent (scratch purges after 30 days); ~65 GB for the default pair, inside the 2 TB group quota |
-| page images, page JSON | `/scratch/ikoutis/$USER/wocr/work` | large (1–3 MB per page at 200 dpi), regenerable |
+| page images, page JSON | `/scratch/ikoutis/$USER/wocr/work/<profile>` | large (1–3 MB per page at 200 dpi), regenerable; one directory per model profile so that two profiles never share a reading |
 | Markdown, figures, reports | `/project/ikoutis/$USER/wocr/out` | the product; backed up |
 
 Weights are staged once with `tools/stage_models.py`, either on a login node (the dml
@@ -333,9 +346,11 @@ convention) or in an interactive CPU session if the login node's per-user limits
 Jobs run with `HF_HUB_OFFLINE=1`.
 
 **Environment.** One conda env holds the pipeline client (httpx, pillow, pypdfium2) and vLLM,
-whose wheels bundle torch and the CUDA runtime. The GPU nodes' driver version is not published.
-The setup script therefore ends with a one-line `srun` on the `debug_gpu` partition that prints
-`nvidia-smi` and checks that torch sees the A100. If the newest vLLM wheel needs a newer CUDA
+whose wheels bundle torch and the CUDA runtime. The GPU nodes' driver version is not published,
+so the setup has a GPU check, run on the free `debug_gpu` partition:
+`srun --account=ikoutis --qos=debug --partition=debug_gpu --gres=gpu:a100_10g:1
+--time=00:10:00 bash -l tools/setup_env.sh --gpu-check`. It prints `nvidia-smi` and whether
+torch sees the A100. If the newest vLLM wheel needs a newer CUDA
 than the driver supports, there are two fallbacks: pin an older vLLM (`WOCR_VLLM_SPEC`) or run
 the official container under Apptainer (`module load apptainer`; `apptainer pull
 docker://vllm/vllm-openai:<tag>` on a compute node).
@@ -385,6 +400,13 @@ VS Code, and MkDocs with arithmatex:
 - `<!-- page N -->` comments mark page boundaries (invisible when rendered; `--no-page-markers`
   turns them off).
 - Running headers, footers, and page numbers are dropped from the Markdown but kept in the JSON.
+- Pages that need a human say so in place:
+  - `<!-- page N: OCR failed, see report.json -->` marks a page the reader could not read;
+  - `<!-- page N: the reader's output was cut off here, see report.json -->` marks a region
+    lost to truncated output that review could not recover.
+
+  `report.json` lists both (`failed_pages`, `truncated_pages`), along with review errors and
+  every remaining flag.
 
 ## 7. Evaluation plan
 

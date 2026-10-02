@@ -64,7 +64,8 @@ def render_block(b: Block) -> str:
         if desc:
             summary = "Figure description (generated)"
             if b.meta.get("kind") == "graph" and "Graph — TikZ" in desc:
-                summary += " — graph as Markdown and as TikZ"
+                summary += (" — graph as TikZ (Markdown version unavailable)"
+                            if "not available" in desc else " — graph as Markdown and as TikZ")
             parts.append(f"<details><summary>{summary}</summary>\n\n"
                          f"{desc.strip()}\n\n</details>")
         if c:                 # some readers transcribe text inside figures

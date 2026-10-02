@@ -156,6 +156,11 @@ class ReviewPolicy:
             return False
         if "page_failed" in b.flags:    # a failed page's placeholder: re-read, not reviewed
             return False
+        if b.meta.get("truncated_tail") and not b.bbox:
+            # The lost region of a box-less reader (markdown/olmocr) is unknown:
+            # a whole-page crop would re-transcribe what was kept. Leave it
+            # flagged for report.json instead.
+            return False
         # "latex_unchecked" alone is no reason to review: it says only that
         # KaTeX was down when the block was read (_review_block re-checks).
         flagged = bool(set(b.flags) - {"latex_unchecked"})

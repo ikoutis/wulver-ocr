@@ -204,7 +204,7 @@ class TestFailedChecksPublishNoPartialGraph:     # gate-2, docs-6
         assert "**Graph — TikZ:**\n\n```latex\n\\begin{tikzpicture}" in desc
         # the partial parse is kept, but never as the graph to score
         assert "graph" not in fig.meta and len(fig.meta["graph_partial"]["nodes"]) == 2
-        assert "graph as Markdown and as TikZ" in render_block(fig)
+        assert "graph as TikZ (Markdown version unavailable)" in render_block(fig)
 
     def test_passing_tikz_gives_the_same_graph_twice(self, figure_page):
         fig, requests = describe(figure_page, lambda p, n: graph_reply(FLOW))

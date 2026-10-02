@@ -11,6 +11,76 @@ the entry it answers.
 
 ---
 
+## 2026-10-02 — Note [O-004]: adversarial code review before the first GPU run — 82 defects fixed
+
+Nothing in this repo has met a real model yet, so before [O-002] spends GPU hours, the whole
+codebase went through a structured review. Five independent reviewers each took one area:
+
+- the pipeline core and resume logic;
+- the reader adapters;
+- the validators, gate, and TikZ;
+- the SLURM and environment scripts;
+- the docs against the code.
+
+A separate skeptic then tried to reproduce or refute every finding in a scratch copy of the
+repo. Of 83 findings, 82 were confirmed and 1 was refuted. The fixes were made in five
+parallel branches with strictly separate files, then merged. The test suite went from 101 to
+328 tests (322 run without node/KaTeX; the other 6 need it).
+
+**What would have gone wrong on the cluster.** These are the ones that matter most:
+
+- **Two array tasks on one node shared a model server.** The ports were fixed (8001/8002), and
+  Wulver packs up to four of our one-GPU tasks onto a 4-GPU node. The second task's vLLM failed
+  to bind, but its readiness check found the *first* task's server. It then ran on another
+  task's GPU, and failed when that task shut its server down.
+  - *Now:* each server takes a free port, and readiness is tied to our own process and log.
+- **A crashed reviewer passed off unreviewed pages as reviewed.** A vLLM crash mid-review
+  turned every remaining request into an error entry. Each page was still saved as reviewed,
+  the job ended COMPLETED, and nothing showed it.
+  - *Now:* server failures and successful-but-rejected requests are different errors.
+  - Pages hit by a server failure are not saved, and the stage exits 3.
+  - A circuit breaker stops a dead server from costing every remaining item its full retry
+    schedule.
+- **Preemption threw away work and could overrun the warning.** The stop signal was ignored
+  until the end of the current document, and then that document's review was discarded. A long
+  document could outlast the 10-minute warning and be killed without a requeue.
+  - *Now:* review is one pool across the whole shard, with each page saved when its last request
+    finishes.
+  - After a stop, no new request starts.
+  - The warning is 30 minutes (as in dml).
+- **A fresh clone could not submit.** `#SBATCH --output=logs/...` needs `logs/` to exist, and it
+  was git-ignored. *Now:* `logs/.gitkeep`.
+- **One bad page or file blocked its document, and its shard, forever.** *Now:* a page the reader
+  cannot read is retried once, then saved as a visible placeholder. An input that cannot be
+  ingested gets `FAILED.json`, which the recovery tool treats as final.
+
+**What would have come out wrong in the Markdown.** The reader adapters lost or garbled content
+on realistic replies:
+
+- equation numbers and prose dropped from equation blocks;
+- emphasis glued to the next word;
+- `a < b` inside math swallowing the rest of the paragraph;
+- a hallucinated image description injected into body text;
+- a truncated reply leaking a literal `<<TRUNCATED>>` marker.
+
+A cut-off reply is now handled by an explicit *truncated-tail* region. The page is re-read once.
+If it is still cut off, the reviewer transcribes the missing region from its crop, and anything
+still missing is marked in the Markdown and in `report.json`. Other fixes:
+
+- The validators no longer send legitimate tables to review as "repetition loops".
+- The KaTeX check restarts its worker, or says `latex_unchecked`, instead of silently passing
+  everything.
+- The TikZ parser now reads the forms models actually write (picture-level arrow styles, node
+  options in any order, automata loops).
+- A graph whose TikZ still fails its checks no longer gets a partial Markdown version that
+  contradicts it.
+
+**New:** an `olmocr` reader and profile reproduce olmOCR-2's own pipeline settings, so the
+published baseline (arms A0/A5) can be run as is.
+
+None of this changes what [O-002] asks for. Its instructions were corrected where they would
+have failed: activate the env, the GPU check command, the per-profile work directory.
+
 ## 2026-10-01 — Note [O-003]: decisions from Ioannis — TikZ graphs, Markdown target, qos=low
 
 Ioannis answered three of the open questions in `design.md` §9.

@@ -7,6 +7,7 @@ __pycache__/
 work/
 out/
 *.pdf
+!samples/*.pdf          # the smoke-run samples (samples/README.md)
 
 # SLURM stdout/stderr and vLLM server logs. The directory itself is tracked
 # (logs/.gitkeep): SLURM opens --output=logs/... before the script runs and

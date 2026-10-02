@@ -59,7 +59,8 @@ _ESCAPES = {r"\*": r"(?<!\\)\*", r"\_": r"(?<!\\)_", r"\`": r"(?<!\\)`",
             "&lt;": r"<(?=[A-Za-z/!?])", "&amp;": r"&(?!amp;|lt;)(?=#?\w+;)",
             r"\#": r"(?m)^ {0,3}#", r"\-": r"(?m)^ {0,3}-(?=\s|$)",
             r"\+": r"(?m)^ {0,3}\+(?=\s|$)", r"\>": r"(?m)^ {0,3}>",
-            r"\.": r"(?m)^ {0,3}\d{1,9}\.(?=\s|$)"}
+            r"\.": r"(?m)^ {0,3}\d{1,9}\.(?=\s|$)",
+            "\\\n": r"(?<!\\)\n"}         # hard line break (htmlmd.HARD_BREAK, from <br>)
 # Answers to "transcribe this region" that are not a transcription: a bare
 # number (the page number at the foot of a tail crop), a placeholder, or a
 # one-line note about the crop. (Answers without a letter or digit are

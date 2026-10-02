@@ -18,8 +18,8 @@ code afresh, again with a skeptic reproducing each finding in a scratch copy. It
 findings: 36 new ones and 5 earlier ones that were only partly fixed. Several are the same
 defect seen by more than one reviewer, so there were 29 distinct defects. All were fixed in
 three parallel branches with separate files (core and cluster scripts; reader adapters; gate
-and figures). On the core-and-scripts branch the suite went from 328 to 344 tests (338 run
-without node/KaTeX).
+and figures), then merged. The merged suite went from 328 to 473 tests (466 run without
+node/KaTeX; the other 7 need it).
 
 **Recovery that did not recover.** These would have cost work on the cluster without saying so.
 

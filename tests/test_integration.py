@@ -57,3 +57,13 @@ def test_every_profile_names_a_registered_adapter():
         if f.endswith(".sh"):
             prof = stage_models.read_profile(f[:-3])
             assert prof["READER_ADAPTER"] in READERS, f
+
+
+def test_gate_keeps_reader_hard_line_breaks():
+    # htmlmd turns <br> into a Markdown hard break; a reviewer that "cleans"
+    # the backslash away would silently turn it into a soft break
+    from src.readers.htmlmd import HARD_BREAK
+    from src.review import dropped_escapes
+    draft = f"Department of Mathematics{HARD_BREAK}NJIT, Newark"
+    assert dropped_escapes(draft, "Department of Mathematics\nNJIT, Newark") == [HARD_BREAK]
+    assert dropped_escapes(draft, draft) == []

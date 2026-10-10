@@ -11,6 +11,69 @@ the entry it answers.
 
 ---
 
+## 2026-10-02 — Claude: [O-002] results — the smoke run went end to end on one A100
+
+Job 1367698 on `n0024` (one A100-SXM4-80GB, `qos=low`), 10 min 43 s from start to `done` for
+the three inputs (13 pages): the IEEE paper (6 pages, born-digital), the 19th-century book
+scan (1 page), and a handwritten CS 241 quiz (6 pages, on `/project` only).
+
+**What the run measured.**
+
+| step | time |
+|---|---|
+| reader (Chandra OCR 2) ready | 266 s after start; 55 GB of KV cache |
+| read, 13 pages | 27 s |
+| reviewer (Qwen3.8-27B) ready | 320 s after start |
+| review, 30 requests (24 formula verdicts, 6 figure descriptions) | 19 s |
+| assemble, 3 documents | 1 s |
+
+`report.json`: no failed or truncated pages, no open validator flags, no review errors, on any
+document. Review decisions: 23 formulas agreed, 1 edited (`|P(C)| = 8` →
+`|\mathcal{P}(C)| = 8`, change fraction 0.33, accepted by the gate); 6 figures described
+(1 diagram, 2 plots, 3 other), 0 errors. With 13 pages the servers ran far below their batch
+size, so the per-page rates are latencies; design.md §5 now carries these numbers and what
+they imply (a task's fixed cost is ~10 min of loading; the rates need a run of hundreds of
+pages). Estimate for 100 such documents: 25–45 min of one A100 in a single task.
+
+**What the output looks like.**
+
+- The reader handled the handwritten quiz well: every formula and every handwritten answer
+  transcribed, the circled True/False answers (and circled digits in the scratch work) as
+  `[x]`, the truth table as a table, the student's proof as a numbered list. The scratch work
+  for a power set was partly mis-read (singletons merged into a set); that block is body text
+  with inline math, which the reviewer does not proofread by design, and the trade-off stands.
+- The reviewer's figure descriptions are factual and detailed: the stereo geometry with its
+  symbols, the three noise-level MSE plots with axes and series, the frames-and-disparity-maps
+  grid, the emblem on the old book's cover. For the stereo-geometry drawing it chose the kind "diagram", for which the prompt also
+  asks for Mermaid flowchart code, which cannot draw camera geometry. Whether it produced
+  such code or left the structure empty is not checked yet; if it did, the prompt should
+  send geometric drawings to "other".
+- One defect: every numbered list came out double-numbered (`1. 1\. Ana scored 90 …`):
+  Chandra leaves the item's number in the item's text, and the converter escaped it and
+  numbered again. Fixed in `htmlmd._list` (an item's own number is its marker). Blocks are
+  converted at read time, so the fix needed a forced re-read (`READ_ARGS=--force`), not a
+  re-assembly: submitted (`READ_ARGS=--force`); its output is not checked yet.
+- Untested: the two graph outputs ("Graph — Markdown (simple)" and "Graph — TikZ"). None of
+  the inputs has a graph drawing (Ioannis confirmed the quiz has no figures). The next run needs
+  a page with one, ideally hand-drawn.
+- Headings keep the bold markers the reader put around them (`## **2. From sentences to
+  symbols**`). Cosmetic; left as is for now.
+
+**Lessons for the next runs.**
+
+- A block's Markdown is made at read time. A converter fix reaches already-read pages only
+  through a re-read (GPU time). Keeping the reader's raw output in the page JSON would allow a
+  CPU-only re-conversion; worth doing before a large corpus is read.
+- Document IDs come from file names. For student work the file names carry names; outputs
+  stay on `/project`, but a corpus of exams should be renamed (or IDs hashed) before ingest.
+- The environment problems are in the previous entry; none is in the pipeline, all are now in
+  the scripts.
+
+**Next.** A page with a drawn graph; a run of a few hundred pages for the throughput numbers;
+then M2 (the evaluation set) and the open questions of design.md §9 (corpus, licence).
+
+---
+
 ## 2026-10-02 — Ioannis / Claude: [O-002] first contact with Wulver — three environment problems, then the servers start
 
 The set-up steps of [O-002] were run on Wulver today. The GPU nodes have driver 580.159.04
